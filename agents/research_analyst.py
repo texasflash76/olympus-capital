@@ -1,7 +1,6 @@
 from tools.news_fetcher import get_news
 from schemas import validate_research_brief
-from agents.llm_client import call_llm_manual
-
+from agents.llm_client import call_llm
 
 RESEARCH_ANALYST_SYSTEM_PROMPT = """
 You are a financial research analyst at a quantitative hedge fund.
@@ -15,6 +14,19 @@ Important rules:
 - Return ONLY valid JSON.
 - Do not include markdown.
 - Do not include explanations outside the JSON.
+
+When analyzing the ticker, look specifically for:
+- recent earnings or guidance changes
+- analyst upgrades or downgrades
+- product launches
+- AI, cloud, data center, or sector-specific catalysts
+- regulatory or legal risks
+- macro risks like interest rates or consumer demand
+- valuation concerns if mentioned in the news
+- whether the news is actually meaningful or just noise
+
+If the provided news is weak, say that clearly in the summary and lower confidence.
+Do not invent catalysts.
 
 Return JSON matching this exact schema:
 
@@ -79,7 +91,7 @@ def run_research_analyst(ticker: str):
     news_items = get_news(ticker)
     prompt = build_research_prompt(ticker, news_items)
 
-    raw_output = call_llm_manual(prompt)
+    raw_output = call_llm(prompt)
 
     validated_output = validate_research_brief(raw_output)
 
