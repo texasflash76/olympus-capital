@@ -6,6 +6,7 @@ certifi==2026.4.22
 charset-normalizer==3.4.7
 click==8.3.3
 fastapi==0.136.1
+feedparser==6.0.12
 h11==0.16.0
 idna==3.14
 Jinja2==3.1.6
@@ -17,8 +18,10 @@ pydantic==2.13.4
 pydantic_core==2.46.4
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
+python-multipart==0.0.28
 pytz==2026.2
 requests==2.33.1
+sgmllib3k==1.0.0
 six==1.17.0
 sseclient-py==1.9.0
 starlette==1.0.0
