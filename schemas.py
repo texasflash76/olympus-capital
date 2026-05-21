@@ -10,7 +10,7 @@ class ResearchBrief(BaseModel):
     catalysts: list[str]
     risks: list[str]
     summary: str = Field(max_length=600)
-
+    research_sources: list[str] = []
 
 class QuantSignal(BaseModel):
     ticker: str
@@ -26,7 +26,7 @@ class QuantSignal(BaseModel):
 class PMDecision(BaseModel):
     ticker: str
     decision: Literal["EXECUTE", "VETO"]
-    direction: Literal["long", "short"]
+    direction: Literal["long", "short", "flat"]
     size_pct: int = Field(ge=1, le=15)
     reasoning: str = Field(min_length=30)
     risk_flags: list[str]
