@@ -13,9 +13,29 @@ from logger import DB_PATH, init_db
 from orchestrator import run_one_ticker
 from screener import screen_market
 from recommender import run_recommender
-from tools.broker import get_account_summary, get_positions
+from tools.broker import (
+    get_account_summary as fetch_account_summary,
+    get_positions as fetch_positions,
+)
 from tools.web_research import get_web_research
+from fast_scan import run_fast_scan, get_fast_scan_results, get_fast_scan_status
+from deep_review import run_deep_review, get_deep_review_results, get_deep_review_status
+from performance_tracker import (
+    PERFORMANCE_STATUS_PATH,
+    update_performance,
+    get_outcomes,
+    summarize_outcomes,
+)
+from tools.sector_intelligence import (
+    CANONICAL_SECTORS,
+    SECTOR_INTELLIGENCE_PATH,
+    SECTOR_SCAN_RESULTS_PATH,
+    refresh_all_sector_intelligence,
+    get_cached_sector_intelligence,
+    scan_sector,
+)
 
+from position_monitor import review_all_positions, get_position_review, execute_position_sell
 
 app = FastAPI(title="Olympus Capital Dashboard")
 
@@ -29,9 +49,49 @@ RECOMMENDER_STATUS_PATH = Path("recommender_status.json")
 RECOMMENDER_HISTORY_PATH = Path("recommender_history.json")
 recommender_lock = threading.Lock()
 
+performance_lock = threading.Lock()
+
+fast_scan_lock = threading.Lock()
+deep_review_lock = threading.Lock()
+
+ACCOUNT_CACHE = {
+    "account": None,
+    "positions": None,
+    "cached_at": None,
+}
+ACCOUNT_CACHE_SECONDS = 60
+
+sector_lock = threading.Lock()
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_cached_account_and_positions():
+    """
+    Avoids hitting Alpaca every single time the dashboard page loads.
+    This makes navigation back to / much faster.
+    """
+    now = datetime.now(timezone.utc)
+    cached_at = ACCOUNT_CACHE.get("cached_at")
+
+    if (
+        cached_at is not None
+        and ACCOUNT_CACHE.get("account") is not None
+        and ACCOUNT_CACHE.get("positions") is not None
+        and (now - cached_at).total_seconds() < ACCOUNT_CACHE_SECONDS
+    ):
+        return ACCOUNT_CACHE["account"], ACCOUNT_CACHE["positions"]
+
+    account = fetch_account_summary()
+    positions = fetch_positions()
+
+    ACCOUNT_CACHE["account"] = account
+    ACCOUNT_CACHE["positions"] = positions
+    ACCOUNT_CACHE["cached_at"] = now
+
+    return account, positions
 
 
 def write_json(path: Path, data):
@@ -917,13 +977,24 @@ NEWS_HEADLINE_CACHE = {}
 
 def render_ticker_headlines(ticker: str):
     """
-    Renders recent news headlines for a ticker in the dashboard.
-    Uses a simple cache so the dashboard does not refetch headlines constantly.
+    Fast homepage headline renderer.
+
+    The old version fetched live web research for every ticker on the homepage.
+    That made going back to the dashboard slow. Homepage now avoids live web calls
+    by default. Set DASHBOARD_LIVE_HEADLINES=true if you want the old behavior.
     """
     ticker = str(ticker or "").upper().strip()
 
     if not ticker:
         return "<span class='empty'>No ticker found.</span>"
+
+    live_headlines_enabled = os.getenv("DASHBOARD_LIVE_HEADLINES", "false").lower() == "true"
+
+    if not live_headlines_enabled:
+        return (
+            "<span class='muted small'>Live headlines disabled on homepage for speed. "
+            "Use Recommendations or Sector Intelligence for headline review.</span>"
+        )
 
     now = datetime.now(timezone.utc)
     cached = NEWS_HEADLINE_CACHE.get(ticker)
@@ -931,7 +1002,7 @@ def render_ticker_headlines(ticker: str):
     if cached:
         cached_at = cached.get("cached_at")
         html = cached.get("html")
-        if cached_at and html and (now - cached_at).total_seconds() < 900:
+        if cached_at and html and (now - cached_at).total_seconds() < 1800:
             return html
 
     try:
@@ -972,8 +1043,7 @@ def render_ticker_headlines(ticker: str):
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard_home():
-    account = get_account_summary()
-    positions = get_positions()
+    account, positions = get_cached_account_and_positions()
 
     save_portfolio_snapshot(account)
 
@@ -1138,6 +1208,13 @@ def dashboard_home():
                 and the single-ticker test is the only mode that may submit a paper trade.
             </p>
 
+            <div class="button-row" style="margin-bottom: 18px;">
+                <a href="/fast-scan" class="btn btn-blue">Fast Scan</a>
+                <a href="/deep-review" class="btn btn-green">Deep AI Review</a>
+                <a href="/positions" class="btn btn-red">Position Monitor</a>
+                <a href="/performance" class="btn btn-dark">Performance Tracker</a>
+            </div>
+
             <div class="tool-grid">
                 <div class="card-soft">
                     <h3><span class="tool-number">1</span>Market Screener</h3>
@@ -1168,7 +1245,33 @@ def dashboard_home():
                 </div>
 
                 <div class="card-soft">
-                    <h3><span class="tool-number">3</span>Single-Ticker AI Trade Test</h3>
+                    <h3><span class="tool-number">P</span>Performance Tracker</h3>
+                    <p>
+                        Tracks how past recommendations performed after they were generated.
+                    </p>
+                    <p class="muted small">
+                        Use this to measure win rate, average return, drawdown, and whether Olympus is actually finding useful ideas.
+                    </p>
+                    <div class="button-row">
+                        <a href="/performance" class="btn btn-blue">Open Performance</a>
+                    </div>
+                </div>
+
+                <div class="card-soft">
+                    <h3><span class="tool-number">3</span>Sector Intelligence</h3>
+                    <p>
+                        Reviews sector-level sentiment and headlines so you can choose where to scan before running stock analysis.
+                    </p>
+                    <p class="muted small">
+                        Use this to decide whether Technology, Energy, Financials, Healthcare, or another sector has the strongest setup.
+                    </p>
+                    <div class="button-row">
+                        <a href="/sectors" class="btn btn-green">Open Sector Scanner</a>
+                    </div>
+                </div>
+
+                <div class="card-soft">
+                    <h3><span class="tool-number">4</span>Single-Ticker AI Trade Test</h3>
                     <p>
                         Submit one ticker to the full Olympus system and let the AI decide whether to trade or veto.
                     </p>
@@ -1633,6 +1736,17 @@ def recommendations_page():
             market_sentiment = escape(str(rec.get("market_sentiment", {}).get("label", "mixed")))
             reasoning = escape(str(pm.get("reasoning", rec.get("error", ""))))
 
+            quality = rec.get("quality_review", {})
+            quality_reasons = quality.get("reasons", [])
+
+            if quality_reasons:
+                quality_html = "<ul>" + "".join(
+                    f"<li>{escape(str(reason))}</li>"
+                    for reason in quality_reasons
+                ) + "</ul>"
+            else:
+                quality_html = "<span class='empty'>No quality rejection reasons.</span>"
+
             watch_rows += f"""
             <tr>
                 <td>{ticker}</td>
@@ -1641,7 +1755,7 @@ def recommendations_page():
                 <td>{escape(str(rec.get("recommendation_type", "")))}</td>
                 <td>{sector}</td>
                 <td>{market_sentiment}</td>
-                <td>{reasoning}</td>
+                <td>{reasoning}<br><br><b>Quality Review</b>{quality_html}</td>
                 <td>{render_recent_headlines(rec)}</td>
             </tr>
             """
@@ -1840,3 +1954,1128 @@ def api_portfolio_history():
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+def render_sector_headlines(headlines):
+    items = []
+
+    for item in headlines:
+        title = escape(str(item.get("title", "")))
+        link = escape(str(item.get("link", "")))
+        published = escape(str(item.get("published", "")))
+
+        if title and link:
+            items.append(
+                f'<li><a href="{link}" target="_blank">{title}</a><br><span class="muted small">{published}</span></li>'
+            )
+        elif title:
+            items.append(f'<li>{title}</li>')
+
+    if not items:
+        return "<span class='empty'>No headlines found.</span>"
+
+    return "<ul>" + "".join(items[:8]) + "</ul>"
+
+
+def run_sector_scan_background(sector, top_n=25, max_symbols=500, max_sector_symbols=150):
+    if sector_lock.locked():
+        return
+
+    with sector_lock:
+        write_json(SECTOR_SCAN_RESULTS_PATH, {
+            "status": "running",
+            "generated_at": now_iso(),
+            "sector": sector,
+            "message": f"Scanning {sector} sector.",
+            "candidates": [],
+        })
+
+        try:
+            result = scan_sector(
+                sector=sector,
+                top_n=top_n,
+                max_symbols=max_symbols,
+                max_sector_symbols=max_sector_symbols,
+            )
+
+            result["status"] = "complete"
+            result["message"] = f"Sector scan complete for {sector}."
+            write_json(SECTOR_SCAN_RESULTS_PATH, result)
+
+        except Exception as e:
+            write_json(SECTOR_SCAN_RESULTS_PATH, {
+                "status": "error",
+                "generated_at": now_iso(),
+                "sector": sector,
+                "message": str(e),
+                "candidates": [],
+            })
+
+
+@app.post("/refresh-sector-intelligence")
+def refresh_sector_intelligence_route():
+    refresh_all_sector_intelligence(limit=6)
+    return RedirectResponse(url="/sectors", status_code=303)
+
+
+@app.post("/run-sector-scan")
+def run_sector_scan_route(
+    sector: str = Form(...),
+    top_n: int = Form(25),
+    max_symbols: str = Form("500"),
+    max_sector_symbols: int = Form(150),
+):
+    if sector_lock.locked():
+        return RedirectResponse(url="/sectors", status_code=303)
+
+    parsed_max_symbols = parse_max_symbols(max_symbols)
+
+    thread = threading.Thread(
+        target=run_sector_scan_background,
+        kwargs={
+            "sector": sector,
+            "top_n": top_n,
+            "max_symbols": parsed_max_symbols,
+            "max_sector_symbols": max_sector_symbols,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return RedirectResponse(url="/sectors", status_code=303)
+
+
+@app.get("/sectors", response_class=HTMLResponse)
+def sectors_page():
+    sector_intel = get_cached_sector_intelligence()
+
+    if not sector_intel.get("sectors"):
+        try:
+            sector_intel = refresh_all_sector_intelligence(limit=6)
+        except Exception:
+            sector_intel = {
+                "generated_at": None,
+                "sectors": [],
+            }
+
+    sector_scan = read_json(SECTOR_SCAN_RESULTS_PATH, {
+        "status": "not_started",
+        "generated_at": None,
+        "sector": None,
+        "message": "No sector scan has been run yet.",
+        "candidates": [],
+    })
+
+    sector_options = ""
+
+    for sector in CANONICAL_SECTORS:
+        selected = "selected" if sector == sector_scan.get("sector") else ""
+        sector_options += f'<option value="{escape(sector)}" {selected}>{escape(sector)}</option>'
+
+    sector_cards = ""
+
+    for item in sector_intel.get("sectors", []):
+        sector = escape(str(item.get("sector", "")))
+        sentiment = item.get("sentiment", {})
+        label = escape(str(sentiment.get("label", "mixed")))
+        relative_label = escape(str(sentiment.get("relative_label", "neutral")))
+        rank = escape(str(sentiment.get("rank", "")))
+        score = escape(str(sentiment.get("score", "50")))
+        headlines_html = render_sector_headlines(item.get("headlines", []))
+
+        positive_drivers = sentiment.get("top_positive_drivers", [])
+        negative_drivers = sentiment.get("top_negative_drivers", [])
+
+        driver_items = []
+
+        for driver in positive_drivers[:2]:
+            term = escape(str(driver.get("term", "")))
+            headline = escape(str(driver.get("headline", "")))
+            driver_items.append(f"<li><b>Positive:</b> {term} — {headline}</li>")
+
+        for driver in negative_drivers[:2]:
+            term = escape(str(driver.get("term", "")))
+            headline = escape(str(driver.get("headline", "")))
+            driver_items.append(f"<li><b>Negative:</b> {term} — {headline}</li>")
+
+        if driver_items:
+            drivers_html = "<ul>" + "".join(driver_items) + "</ul>"
+        else:
+            drivers_html = "<p class='muted small'>No strong sentiment keywords found. Score is mostly neutral.</p>"
+
+        css_class = "approved" if relative_label == "favorable" else "blocked" if relative_label == "weak" else "vetoed"
+
+        sector_cards += f"""
+        <div class="card-soft">
+            <h3>#{rank} {sector}</h3>
+            <p>
+                {badge(relative_label, css_class)}
+                {badge(label, "neutral")}
+                <span class="muted small">Score: {score}/100</span>
+            </p>
+            <h4>Sentiment Drivers</h4>
+            {drivers_html}
+            <h4>Important Headlines</h4>
+            {headlines_html}
+        </div>
+        """
+
+    if not sector_cards:
+        sector_cards = """
+        <div class="card-soft">
+            <h3>No sector intelligence yet</h3>
+            <p class="muted">Refresh sector intelligence to load headlines and sentiment.</p>
+        </div>
+        """
+
+    candidates = sector_scan.get("candidates", [])
+    candidate_rows = ""
+
+    for candidate in candidates:
+        ticker = escape(str(candidate.get("ticker", "")))
+        company_name = escape(str(candidate.get("company_name", "")))
+        industry = escape(str(candidate.get("industry", "")))
+        score = escape(str(candidate.get("screener_score", "")))
+        reasoning = escape(str(candidate.get("reasoning", "")))
+        summary = candidate.get("technical_summary", {})
+
+        close = escape(str(summary.get("close", "")))
+        rsi = escape(str(summary.get("rsi", "")))
+        macd = escape(str(summary.get("macd", "")))
+        volume_ratio = escape(str(summary.get("volume_ratio", "")))
+
+        candidate_rows += f"""
+        <tr>
+            <td>{ticker}</td>
+            <td>{company_name}</td>
+            <td>{industry}</td>
+            <td>{score}</td>
+            <td>{close}</td>
+            <td>{rsi}</td>
+            <td>{macd}</td>
+            <td>{volume_ratio}</td>
+            <td>{reasoning}</td>
+        </tr>
+        """
+
+    if not candidate_rows:
+        candidate_rows = """
+        <tr>
+            <td colspan="9">No sector scan candidates yet.</td>
+        </tr>
+        """
+
+    scan_status = sector_scan.get("status", "not_started")
+    refresh_tag = ""
+
+    if scan_status == "running":
+        refresh_tag = '<meta http-equiv="refresh" content="10">'
+
+    scan_sector_name = escape(str(sector_scan.get("sector", "None")))
+    scan_message = escape(str(sector_scan.get("message", "")))
+
+    scan_headlines_html = ""
+    scan_intel = sector_scan.get("sector_intelligence", {})
+
+    if scan_intel:
+        scan_headlines_html = render_sector_headlines(scan_intel.get("headlines", []))
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Sector Intelligence</title>
+        {refresh_tag}
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>Sector Intelligence</h1>
+            <p class="subtitle">
+                Review sector-level sentiment and headlines first, then choose which sector to scan for stock candidates.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Refresh Sector Sentiment</h2>
+            <p class="muted small">
+                This pulls important headlines for each sector and creates a basic sentiment score.
+            </p>
+
+            <form method="post" action="/refresh-sector-intelligence">
+                <button type="submit">Refresh Sector Intelligence</button>
+            </form>
+
+            <p class="muted small">Last refreshed: {escape(str(sector_intel.get("generated_at")))}</p>
+        </div>
+
+        <div class="card">
+            <h2>Scan a Selected Sector</h2>
+
+            <div class="callout">
+                Use the sector sentiment cards below to decide what looks strongest, then scan only that sector.
+            </div>
+
+            <form method="post" action="/run-sector-scan" style="margin-top:16px;">
+                <label>Sector:</label>
+                <select name="sector">
+                    {sector_options}
+                </select>
+
+                <label>Top N:</label>
+                <input type="number" name="top_n" value="25" min="1" max="100">
+
+                <label>Max universe symbols:</label>
+                <input type="text" name="max_symbols" value="500">
+
+                <label>Max sector symbols:</label>
+                <input type="number" name="max_sector_symbols" value="150" min="10" max="1000">
+
+                <button type="submit">Run Sector Scan</button>
+            </form>
+
+            <p class="muted small">
+                For testing, use max universe symbols = 500. Later, use all for broader coverage.
+            </p>
+        </div>
+
+        <h2 class="section-title">Sector Sentiment Board</h2>
+        <div class="grid grid-3">
+            {sector_cards}
+        </div>
+
+        <h2 class="section-title">Latest Sector Scan</h2>
+        <div class="card">
+            <p>{badge(scan_status, status_class(scan_status))}</p>
+            <p><b>Sector:</b> {scan_sector_name}</p>
+            <p><b>Message:</b> {scan_message}</p>
+            <p><b>Generated:</b> {escape(str(sector_scan.get("generated_at")))}</p>
+            <p><b>Universe checked:</b> {escape(str(sector_scan.get("universe_checked", "")))}</p>
+            <p><b>Sector ticker count:</b> {escape(str(sector_scan.get("sector_ticker_count", "")))}</p>
+
+            <h3>Important Headlines for Selected Sector</h3>
+            {scan_headlines_html}
+        </div>
+
+        <div class="card">
+            <h2>Top Technical Candidates in Selected Sector</h2>
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Company</th>
+                    <th>Industry</th>
+                    <th>Score</th>
+                    <th>Close</th>
+                    <th>RSI</th>
+                    <th>MACD</th>
+                    <th>Volume Ratio</th>
+                    <th>Reasoning</th>
+                </tr>
+                {candidate_rows}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+
+def run_performance_update_background():
+    if performance_lock.locked():
+        return
+
+    with performance_lock:
+        update_performance(limit=500)
+
+
+@app.post("/update-performance")
+def update_performance_route():
+    if performance_lock.locked():
+        return RedirectResponse(url="/performance", status_code=303)
+
+    thread = threading.Thread(
+        target=run_performance_update_background,
+        daemon=True,
+    )
+    thread.start()
+
+    return RedirectResponse(url="/performance", status_code=303)
+
+
+def format_return(value):
+    if value is None:
+        return "Pending"
+
+    try:
+        value = float(value)
+        sign = "+" if value > 0 else ""
+        return f"{sign}{value:.2f}%"
+    except Exception:
+        return "Pending"
+
+
+def return_class(value):
+    if value is None:
+        return "neutral"
+
+    try:
+        value = float(value)
+    except Exception:
+        return "neutral"
+
+    if value > 0:
+        return "approved"
+
+    if value < 0:
+        return "blocked"
+
+    return "vetoed"
+
+
+@app.get("/performance", response_class=HTMLResponse)
+def performance_page():
+    outcomes = get_outcomes(limit=250)
+    summary = summarize_outcomes(outcomes)
+
+    status = read_json(PERFORMANCE_STATUS_PATH, {
+        "status": "not_started",
+        "message": "Performance has not been updated yet.",
+        "current": 0,
+        "total": 0,
+        "updated_at": None,
+    })
+
+    rows = ""
+
+    for item in outcomes:
+        ticker = escape(str(item.get("ticker", "")))
+        recommended_at = escape(str(item.get("recommended_at", "")))
+        final_status = escape(str(item.get("final_status", "")))
+        outcome_status = escape(str(item.get("outcome_status", "PENDING")))
+        score = escape(str(item.get("recommendation_score", "")))
+        entry_price = money(item.get("entry_price"))
+        latest_price = money(item.get("latest_price"))
+        error = escape(str(item.get("error") or ""))
+
+        rows += f"""
+        <tr>
+            <td>{ticker}</td>
+            <td>{recommended_at}</td>
+            <td>{badge(final_status, status_class(final_status))}</td>
+            <td>{score}</td>
+            <td>{entry_price}</td>
+            <td>{latest_price}</td>
+            <td>{badge(format_return(item.get("return_1d")), return_class(item.get("return_1d")))}</td>
+            <td>{badge(format_return(item.get("return_3d")), return_class(item.get("return_3d")))}</td>
+            <td>{badge(format_return(item.get("return_7d")), return_class(item.get("return_7d")))}</td>
+            <td>{badge(format_return(item.get("return_30d")), return_class(item.get("return_30d")))}</td>
+            <td>{badge(format_return(item.get("max_drawdown")), return_class(item.get("max_drawdown")))}</td>
+            <td>{badge(outcome_status, status_class(outcome_status))}</td>
+            <td>{error}</td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="13">No tracked recommendations yet. Run a recommendation scan first, then update performance.</td>
+        </tr>
+        """
+
+    update_status = escape(str(status.get("status", "not_started")))
+    update_message = escape(str(status.get("message", "")))
+    current = escape(str(status.get("current", 0)))
+    total = escape(str(status.get("total", 0)))
+    updated_at = escape(str(status.get("updated_at", "")))
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Performance Tracker</title>
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>Performance Tracker</h1>
+            <p class="subtitle">
+                Tracks how Olympus recommendations performed after they were generated.
+                This is the proof layer for whether the system is actually useful.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Update Performance</h2>
+            <p>{badge(update_status, status_class(update_status))}</p>
+            <p>{update_message}</p>
+            <p class="muted small">Progress: {current} / {total}</p>
+            <p class="muted small">Last updated: {updated_at}</p>
+
+            <form method="post" action="/update-performance">
+                <button type="submit">Update Recommendation Performance</button>
+            </form>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Tracked Ideas</div>
+                <div class="big-number">{escape(str(summary.get("total_tracked", 0)))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Win Rate</div>
+                <div class="big-number">{format_return(summary.get("win_rate")) if summary.get("win_rate") is not None else "N/A"}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Avg 7D Return</div>
+                <div class="big-number">{format_return(summary.get("avg_7d"))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Avg Max Drawdown</div>
+                <div class="big-number">{format_return(summary.get("avg_max_drawdown"))}</div>
+            </div>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Avg 1D Return</div>
+                <div class="big-number">{format_return(summary.get("avg_1d"))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Avg 3D Return</div>
+                <div class="big-number">{format_return(summary.get("avg_3d"))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Avg 30D Return</div>
+                <div class="big-number">{format_return(summary.get("avg_30d"))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Completed</div>
+                <div class="big-number">{escape(str(summary.get("completed", 0)))}</div>
+            </div>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Early</div>
+                <div class="big-number">{escape(str(summary.get("early", 0)))}</div>
+                <p class="muted small">Has 1D data, not enough time to judge.</p>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Pending</div>
+                <div class="big-number">{escape(str(summary.get("pending", 0)))}</div>
+                <p class="muted small">No forward return data yet.</p>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Wins</div>
+                <div class="big-number">{escape(str(summary.get("wins", 0)))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Losses</div>
+                <div class="big-number">{escape(str(summary.get("losses", 0)))}</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Recommendation Outcomes</h2>
+            <p class="muted small">
+                Returns are calculated from daily close prices using the first available bar at or after the recommendation date.
+            </p>
+
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Recommended At</th>
+                    <th>Original Status</th>
+                    <th>Score</th>
+                    <th>Entry</th>
+                    <th>Latest</th>
+                    <th>1D</th>
+                    <th>3D</th>
+                    <th>7D</th>
+                    <th>30D</th>
+                    <th>Max Drawdown</th>
+                    <th>Outcome</th>
+                    <th>Error</th>
+                </tr>
+                {rows}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+def run_fast_scan_background(top_n=50, max_symbols=500, sector="", only_quality_approved=False):
+    if fast_scan_lock.locked():
+        return
+
+    with fast_scan_lock:
+        run_fast_scan(
+            top_n=top_n,
+            max_symbols=max_symbols,
+            sector=sector if sector else None,
+            only_quality_approved=only_quality_approved,
+        )
+
+
+@app.post("/run-fast-scan")
+def run_fast_scan_route(
+    top_n: int = Form(50),
+    max_symbols: str = Form("500"),
+    sector: str = Form(""),
+    only_quality_approved: str = Form("false"),
+):
+    if fast_scan_lock.locked():
+        return RedirectResponse(url="/fast-scan", status_code=303)
+
+    parsed_max_symbols = parse_max_symbols(max_symbols)
+    only_quality = str(only_quality_approved).lower() in ["true", "on", "1", "yes"]
+
+    thread = threading.Thread(
+        target=run_fast_scan_background,
+        kwargs={
+            "top_n": top_n,
+            "max_symbols": parsed_max_symbols,
+            "sector": sector,
+            "only_quality_approved": only_quality,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return RedirectResponse(url="/fast-scan", status_code=303)
+
+
+@app.get("/fast-scan", response_class=HTMLResponse)
+def fast_scan_page():
+    status = get_fast_scan_status()
+    results = get_fast_scan_results()
+
+    candidates = results.get("candidates", [])
+    summary = results.get("summary", {})
+
+    sector_options = '<option value="">All</option>'
+
+    try:
+        for sector in CANONICAL_SECTORS:
+            selected = "selected" if sector == results.get("sector") else ""
+            sector_options += f'<option value="{escape(sector)}" {selected}>{escape(sector)}</option>'
+    except Exception:
+        pass
+
+    rows = ""
+
+    for item in candidates:
+        ticker = escape(str(item.get("ticker", "")))
+        company = escape(str(item.get("company_name", "")))
+        sector = escape(str(item.get("sector", "")))
+        industry = escape(str(item.get("industry", "")))
+        score = escape(str(item.get("screener_score", "")))
+        quality = item.get("quality_review", {})
+        quality_approved = quality.get("approved")
+        quality_label = "approved" if quality_approved else "rejected"
+        quality_css = "approved" if quality_approved else "blocked"
+
+        reasons = quality.get("reasons", [])
+        warnings = quality.get("warnings", [])
+
+        reason_html = ""
+
+        if reasons:
+            reason_html += "<b>Reasons</b><ul>" + "".join(
+                f"<li>{escape(str(reason))}</li>"
+                for reason in reasons
+            ) + "</ul>"
+
+        if warnings:
+            reason_html += "<b>Warnings</b><ul>" + "".join(
+                f"<li>{escape(str(warning))}</li>"
+                for warning in warnings
+            ) + "</ul>"
+
+        if not reason_html:
+            reason_html = "<span class='empty'>No major quality issues.</span>"
+
+        summary_data = item.get("technical_summary", {})
+        close = escape(str(summary_data.get("close", "")))
+        rsi = escape(str(summary_data.get("rsi", "")))
+        volume_ratio = escape(str(summary_data.get("volume_ratio", "")))
+
+        rows += f"""
+        <tr>
+            <td><b>{ticker}</b></td>
+            <td>{company}</td>
+            <td>{sector}</td>
+            <td>{industry}</td>
+            <td>{score}</td>
+            <td>{close}</td>
+            <td>{rsi}</td>
+            <td>{volume_ratio}</td>
+            <td>{badge(quality_label, quality_css)}<br>{reason_html}</td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="9">No fast scan candidates yet.</td>
+        </tr>
+        """
+
+    scan_status = escape(str(status.get("status", "not_started")))
+    scan_message = escape(str(status.get("message", "")))
+
+    refresh_tag = ""
+    if status.get("status") == "running":
+        refresh_tag = '<meta http-equiv="refresh" content="10">'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Fast Scan</title>
+        {refresh_tag}
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>Fast Scan</h1>
+            <p class="subtitle">
+                Fast Scan uses sector, screener, and quality filters only. It does not run the full LLM review.
+                Use this first, then send selected tickers to Deep AI Review.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Run Fast Scan</h2>
+            <p>{badge(scan_status, status_class(scan_status))}</p>
+            <p>{scan_message}</p>
+
+            <form method="post" action="/run-fast-scan">
+                <label>Top candidates:</label>
+                <input type="number" name="top_n" value="50" min="5" max="200">
+
+                <label>Max symbols:</label>
+                <input type="text" name="max_symbols" value="500">
+
+                <label>Sector:</label>
+                <select name="sector">
+                    {sector_options}
+                </select>
+
+                <label>
+                    <input type="checkbox" name="only_quality_approved">
+                    Only quality approved
+                </label>
+
+                <button type="submit">Run Fast Scan</button>
+            </form>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Candidates</div>
+                <div class="big-number">{escape(str(summary.get("total_candidates", 0)))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Quality Approved</div>
+                <div class="big-number">{escape(str(summary.get("quality_approved", 0)))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Quality Rejected</div>
+                <div class="big-number">{escape(str(summary.get("quality_rejected", 0)))}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Generated</div>
+                <div class="big-number" style="font-size:18px;">{escape(str(results.get("generated_at")))}</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Fast Scan Candidates</h2>
+            <p class="muted small">
+                Copy tickers you like into Deep AI Review.
+            </p>
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Industry</th>
+                    <th>Score</th>
+                    <th>Close</th>
+                    <th>RSI</th>
+                    <th>Volume Ratio</th>
+                    <th>Quality</th>
+                </tr>
+                {rows}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+
+def run_deep_review_background(tickers, allow_execution=False):
+    if deep_review_lock.locked():
+        return
+
+    with deep_review_lock:
+        run_deep_review(
+            tickers=tickers,
+            allow_execution=allow_execution,
+        )
+
+
+@app.post("/run-deep-review")
+def run_deep_review_route(
+    tickers: str = Form(...),
+    allow_execution: str = Form("false"),
+):
+    if deep_review_lock.locked():
+        return RedirectResponse(url="/deep-review", status_code=303)
+
+    allow_exec = str(allow_execution).lower() in ["true", "on", "1", "yes"]
+
+    thread = threading.Thread(
+        target=run_deep_review_background,
+        kwargs={
+            "tickers": tickers,
+            "allow_execution": allow_exec,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return RedirectResponse(url="/deep-review", status_code=303)
+
+
+@app.get("/deep-review", response_class=HTMLResponse)
+def deep_review_page():
+    status = get_deep_review_status()
+    results = get_deep_review_results()
+
+    rows = ""
+
+    for item in results.get("results", []):
+        ticker = escape(str(item.get("ticker", "")))
+        final_status = escape(str(item.get("final_status", "")))
+        sector = escape(str(item.get("sector", "")))
+        industry = escape(str(item.get("industry", "")))
+        error = escape(str(item.get("error", "")))
+
+        research = item.get("research_brief", {})
+        quant = item.get("quant_signal", {})
+        pm = item.get("pm_decision", {})
+        risk = item.get("risk_result", {})
+
+        summary = escape(str(research.get("summary", "")))
+        reasoning = escape(str(pm.get("reasoning", "")))
+        quant_direction = escape(str(quant.get("direction", "")))
+        quant_strength = escape(str(quant.get("strength", "")))
+        risk_approved = escape(str(risk.get("approved", "")))
+
+        rows += f"""
+        <tr>
+            <td><b>{ticker}</b></td>
+            <td>{badge(final_status, status_class(final_status))}</td>
+            <td>{sector}</td>
+            <td>{industry}</td>
+            <td>{quant_direction} / {quant_strength}</td>
+            <td>{risk_approved}</td>
+            <td>{summary}<br><br><b>PM:</b> {reasoning}<br><span class="error">{error}</span></td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="7">No deep review results yet.</td>
+        </tr>
+        """
+
+    review_status = escape(str(status.get("status", "not_started")))
+    review_message = escape(str(status.get("message", "")))
+    current = escape(str(status.get("current", 0)))
+    total = escape(str(status.get("total", 0)))
+
+    refresh_tag = ""
+    if status.get("status") == "running":
+        refresh_tag = '<meta http-equiv="refresh" content="10">'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Deep AI Review</title>
+        {refresh_tag}
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>Deep AI Review</h1>
+            <p class="subtitle">
+                Run the full Olympus AI loop only on selected tickers. This is slower, but much more detailed.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Run Deep AI Review</h2>
+            <p>{badge(review_status, status_class(review_status))}</p>
+            <p>{review_message}</p>
+            <p class="muted small">Progress: {current} / {total}</p>
+
+            <form method="post" action="/run-deep-review">
+                <label>Tickers:</label>
+                <input
+                    type="text"
+                    name="tickers"
+                    placeholder="NVDA,AAPL,TSLA"
+                    style="width: 420px;"
+                    required
+                >
+
+                <label>
+                    <input type="checkbox" name="allow_execution">
+                    Allow paper execution
+                </label>
+
+                <button type="submit">Run Deep Review</button>
+            </form>
+
+            <div class="warning-callout" style="margin-top:16px;">
+                Leave paper execution unchecked unless you intentionally want approved ideas to be eligible for paper orders.
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Deep Review Results</h2>
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Status</th>
+                    <th>Sector</th>
+                    <th>Industry</th>
+                    <th>Quant</th>
+                    <th>Risk Approved</th>
+                    <th>Reasoning</th>
+                </tr>
+                {rows}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+
+@app.get("/positions", response_class=HTMLResponse)
+def positions_page(request: Request):
+    data = get_position_review()
+    reviews = data.get("reviews", [])
+    summary = data.get("summary", {})
+    generated_at = data.get("generated_at")
+
+    rows = ""
+
+    if not reviews:
+        rows = """
+        <tr>
+            <td colspan="10">No position review has been run yet.</td>
+        </tr>
+        """
+    else:
+        for item in reviews:
+            ticker = escape(str(item.get("ticker", "")))
+            position = item.get("position", {})
+            decision = item.get("decision", {})
+            technicals = item.get("technicals", {})
+            news_summary = item.get("news_summary", {})
+
+            decision_label = escape(str(decision.get("decision", "UNKNOWN")))
+            css_class = status_class(decision_label)
+
+            qty = position.get("qty", 0)
+            market_value = position.get("market_value", 0)
+            avg_entry = position.get("avg_entry_price", 0)
+            current_price = position.get("current_price", 0)
+            unrealized_pl = position.get("unrealized_pl", 0)
+            unrealized_plpc = float(position.get("unrealized_plpc", 0) or 0) * 100
+
+            rsi = technicals.get("rsi", "")
+            volume_ratio = technicals.get("volume_ratio", "")
+            confidence = decision.get("confidence", 0)
+            sell_pct = decision.get("sell_pct", 0)
+            qty_to_sell = decision.get("estimated_qty_to_sell", 0)
+
+            reasons = decision.get("reasons", [])
+            reasons_html = "<ul>" + "".join(
+                f"<li>{escape(str(reason))}</li>"
+                for reason in reasons
+            ) + "</ul>"
+
+            headlines = news_summary.get("headlines", [])
+            headline_html = ""
+
+            if headlines:
+                headline_html = "<ul>" + "".join(
+                    f"<li>{escape(str(h.get('headline', '')))}</li>"
+                    for h in headlines[:3]
+                ) + "</ul>"
+            else:
+                headline_html = "<span class='empty'>No headlines found.</span>"
+
+            action_html = "<span class='muted'>No sell action</span>"
+
+            if float(sell_pct or 0) > 0:
+                action_html = f"""
+                <form method="post" action="/positions/sell">
+                    <input type="hidden" name="ticker" value="{ticker}">
+                    <input type="hidden" name="sell_pct" value="{sell_pct}">
+                    <button type="submit">Paper sell {sell_pct}%</button>
+                </form>
+                <p class="muted small">Estimated qty: {float(qty_to_sell):.6f}</p>
+                """
+
+            rows += f"""
+            <tr>
+                <td><b>{ticker}</b></td>
+                <td>{badge(decision_label, css_class)}</td>
+                <td>{confidence}</td>
+                <td>{qty}</td>
+                <td>{money(market_value)}</td>
+                <td>{money(avg_entry)} / {money(current_price)}</td>
+                <td>{money(unrealized_pl)}<br>{unrealized_plpc:.2f}%</td>
+                <td>RSI: {rsi}<br>Vol: {volume_ratio}</td>
+                <td>{reasons_html}<br>{headline_html}</td>
+                <td>{action_html}</td>
+            </tr>
+            """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Position Monitor</title>
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>Position Monitor</h1>
+            <p class="subtitle">
+                Reviews open Alpaca paper positions and recommends HOLD, WATCH_CLOSELY, TRIM,
+                TAKE_PROFIT, SELL, or CUT_LOSS.
+            </p>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Open Positions Reviewed</div>
+                <div class="big-number">{summary.get("total_positions", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Take Profit / Trim</div>
+                <div class="big-number">{summary.get("take_profit", 0)} / {summary.get("trim", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Sell / Cut Loss</div>
+                <div class="big-number">{summary.get("sell", 0)} / {summary.get("cut_loss", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Hold / Watch</div>
+                <div class="big-number">{summary.get("hold", 0)} / {summary.get("watch_closely", 0)}</div>
+            </div>
+        </div>
+
+        <section class="card">
+            <h2>Run Position Review</h2>
+            <p class="muted small">Last generated: {escape(str(generated_at))}</p>
+
+            <form method="post" action="/positions/review">
+                <button type="submit">Review Open Positions</button>
+            </form>
+
+            <div class="warning-callout" style="margin-top:16px;">
+                Sell buttons only work if ALPACA_PAPER=true and SELL_TRADING_ENABLED=true.
+                Keep SELL_TRADING_ENABLED=false until you are ready to test paper sell orders.
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Open Position Sell Review</h2>
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Decision</th>
+                    <th>Confidence</th>
+                    <th>Qty</th>
+                    <th>Market Value</th>
+                    <th>Entry / Current</th>
+                    <th>Unrealized P/L</th>
+                    <th>Technicals</th>
+                    <th>Reasoning / News</th>
+                    <th>Action</th>
+                </tr>
+                {rows}
+            </table>
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+
+@app.post("/positions/review")
+def run_positions_review():
+    review_all_positions()
+    return RedirectResponse(url="/positions", status_code=303)
+
+
+@app.post("/positions/sell")
+def sell_position_from_dashboard(
+    ticker: str = Form(...),
+    sell_pct: float = Form(...),
+):
+    try:
+        execute_position_sell(ticker=ticker, sell_pct=sell_pct)
+    except Exception as e:
+        error_path = Path("position_sell_error.json")
+        error_path.write_text(json.dumps({
+            "ticker": ticker,
+            "sell_pct": sell_pct,
+            "error": str(e),
+            "timestamp": now_iso(),
+        }, indent=2))
+
+    review_all_positions()
+    return RedirectResponse(url="/positions", status_code=303)
