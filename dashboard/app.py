@@ -1,3 +1,4 @@
+from trade_thesis_store import get_all_trade_theses
 import os
 import json
 import sqlite3
@@ -36,6 +37,7 @@ from tools.sector_intelligence import (
 )
 
 from position_monitor import review_all_positions, get_position_review, execute_position_sell
+from ai_position_review import run_ai_position_review, get_ai_position_review, execute_ai_sell
 
 app = FastAPI(title="Olympus Capital Dashboard")
 
@@ -1254,6 +1256,7 @@ def dashboard_home():
                     </p>
                     <div class="button-row">
                         <a href="/performance" class="btn btn-blue">Open Performance</a>
+                        <a href="/positions/ai" class="btn btn-red">AI Position Review</a>
                     </div>
                 </div>
 
@@ -3079,3 +3082,316 @@ def sell_position_from_dashboard(
 
     review_all_positions()
     return RedirectResponse(url="/positions", status_code=303)
+
+
+@app.get("/positions/ai", response_class=HTMLResponse)
+def ai_positions_page(request: Request):
+    data = get_ai_position_review()
+    reviews = data.get("reviews", [])
+    summary = data.get("summary", {})
+    generated_at = data.get("generated_at")
+    llm_mode = data.get("llm_mode")
+    manual_prompt_file = data.get("manual_prompt_file")
+
+    rows = ""
+
+    if not reviews:
+        rows = """
+        <tr>
+            <td colspan="11">No AI position review has been run yet.</td>
+        </tr>
+        """
+    else:
+        for item in reviews:
+            ticker = escape(str(item.get("ticker", "")))
+            position_review = item.get("position_review", {})
+            position = position_review.get("position", {})
+            rule_decision = position_review.get("decision", {})
+            ai_decision = item.get("ai_decision", {})
+
+            ai_label = escape(str(ai_decision.get("decision", "UNKNOWN")))
+            rule_label = escape(str(rule_decision.get("decision", "UNKNOWN")))
+
+            css_class = status_class(ai_label)
+
+            qty = position.get("qty", 0)
+            market_value = position.get("market_value", 0)
+            avg_entry = position.get("avg_entry_price", 0)
+            current_price = position.get("current_price", 0)
+            unrealized_pl = position.get("unrealized_pl", 0)
+            unrealized_plpc = float(position.get("unrealized_plpc", 0) or 0) * 100
+
+            confidence = ai_decision.get("confidence", 0)
+            sell_pct = ai_decision.get("sell_pct", 0)
+            qty_to_sell = ai_decision.get("estimated_qty_to_sell", 0)
+
+            reasoning = escape(str(ai_decision.get("reasoning", "")))
+            thesis_status = escape(str(ai_decision.get("thesis_status", "")))
+            rule_agreement = escape(str(ai_decision.get("rule_agreement", "")))
+            profit_notes = escape(str(ai_decision.get("profit_protection_notes", "")))
+            what_changes = escape(str(ai_decision.get("what_would_change_my_mind", "")))
+
+            risk_flags = ai_decision.get("risk_flags", [])
+
+            if isinstance(risk_flags, list) and risk_flags:
+                risk_flags_html = "<ul>" + "".join(
+                    f"<li>{escape(str(flag))}</li>"
+                    for flag in risk_flags
+                ) + "</ul>"
+            else:
+                risk_flags_html = "<span class='muted'>None</span>"
+
+            action_html = "<span class='muted'>No AI sell action</span>"
+
+            if ai_label in ["TRIM", "TAKE_PROFIT", "SELL", "CUT_LOSS"] and float(sell_pct or 0) > 0:
+                action_html = f"""
+                <form method="post" action="/positions/ai-sell">
+                    <input type="hidden" name="ticker" value="{ticker}">
+                    <input type="hidden" name="sell_pct" value="{sell_pct}">
+                    <button type="submit">Paper sell {sell_pct}%</button>
+                </form>
+                <p class="muted small">Estimated qty: {float(qty_to_sell):.6f}</p>
+                """
+
+            rows += f"""
+            <tr>
+                <td><b>{ticker}</b></td>
+                <td>{badge(ai_label, css_class)}</td>
+                <td>{badge(rule_label, status_class(rule_label))}</td>
+                <td>{confidence}</td>
+                <td>{qty}</td>
+                <td>{money(market_value)}</td>
+                <td>{money(avg_entry)} / {money(current_price)}</td>
+                <td>{money(unrealized_pl)}<br>{unrealized_plpc:.2f}%</td>
+                <td>
+                    <b>Thesis:</b> {thesis_status}<br>
+                    <b>Rule agreement:</b> {rule_agreement}<br>
+                    <b>Risks:</b> {risk_flags_html}
+                </td>
+                <td>
+                    <b>Reasoning:</b> {reasoning}<br><br>
+                    <b>Profit notes:</b> {profit_notes}<br><br>
+                    <b>What changes its mind:</b> {what_changes}
+                </td>
+                <td>{action_html}</td>
+            </tr>
+            """
+
+    manual_note = ""
+
+    if manual_prompt_file:
+        manual_note = f"""
+        <div class="warning-callout" style="margin-top:16px;">
+            LLM_MODE is manual, so the dashboard did not call the AI directly.
+            Prompts were written to <b>{escape(str(manual_prompt_file))}</b>.
+            Set LLM_MODE=codex in .env if you want the dashboard to run AI sell reviews automatically.
+        </div>
+        """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus AI Position Review</title>
+        {shared_css()}
+    </head>
+    <body>
+        <p>
+            <a href="/">← Back to Dashboard</a> |
+            <a href="/positions">Rule-Based Position Monitor</a>
+        </p>
+
+        <div class="page-header">
+            <h1>AI Position Review</h1>
+            <p class="subtitle">
+                Uses the Sell Analyst agent to review existing open positions after the rule-based monitor runs.
+            </p>
+        </div>
+
+        <div class="grid grid-4">
+            <div class="card">
+                <div class="metric-title">Positions Reviewed</div>
+                <div class="big-number">{summary.get("total_positions", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Take Profit / Trim</div>
+                <div class="big-number">{summary.get("take_profit", 0)} / {summary.get("trim", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Sell / Cut Loss</div>
+                <div class="big-number">{summary.get("sell", 0)} / {summary.get("cut_loss", 0)}</div>
+            </div>
+
+            <div class="card">
+                <div class="metric-title">Hold / Watch</div>
+                <div class="big-number">{summary.get("hold", 0)} / {summary.get("watch_closely", 0)}</div>
+            </div>
+        </div>
+
+        <section class="card">
+            <h2>Run AI Sell Review</h2>
+            <p class="muted small">Last generated: {escape(str(generated_at))}</p>
+            <p class="muted small">LLM mode: {escape(str(llm_mode))}</p>
+
+            <form method="post" action="/positions/ai-review">
+                <button type="submit">Run AI Review on Open Positions</button>
+            </form>
+
+            {manual_note}
+
+            <div class="danger-callout" style="margin-top:16px;">
+                Paper sell buttons still require ALPACA_PAPER=true and SELL_TRADING_ENABLED=true.
+                Keep SELL_TRADING_ENABLED=false until you are ready to test paper sells.
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>AI Sell Decisions</h2>
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>AI Decision</th>
+                    <th>Rule Decision</th>
+                    <th>Confidence</th>
+                    <th>Qty</th>
+                    <th>Market Value</th>
+                    <th>Entry / Current</th>
+                    <th>Unrealized P/L</th>
+                    <th>Status / Risks</th>
+                    <th>AI Reasoning</th>
+                    <th>Action</th>
+                </tr>
+                {rows}
+            </table>
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
+
+
+@app.post("/positions/ai-review")
+def run_ai_positions_review():
+    run_ai_position_review(force_refresh_positions=True)
+    return RedirectResponse(url="/positions/ai", status_code=303)
+
+
+@app.post("/positions/ai-sell")
+def sell_ai_position_from_dashboard(
+    ticker: str = Form(...),
+    sell_pct: float = Form(...),
+):
+    try:
+        execute_ai_sell(ticker=ticker, sell_pct=sell_pct)
+    except Exception as e:
+        error_path = Path("ai_position_sell_error.json")
+        error_path.write_text(json.dumps({
+            "ticker": ticker,
+            "sell_pct": sell_pct,
+            "error": str(e),
+            "timestamp": now_iso(),
+        }, indent=2))
+
+    run_ai_position_review(force_refresh_positions=True)
+    return RedirectResponse(url="/positions/ai", status_code=303)
+
+
+@app.get("/theses", response_class=HTMLResponse)
+def trade_theses_page(request: Request):
+    data = get_all_trade_theses()
+    theses = data.get("theses", {})
+
+    rows = ""
+
+    if not theses:
+        rows = """
+        <tr>
+            <td colspan="8">No trade theses have been saved yet. Run Deep Review first.</td>
+        </tr>
+        """
+    else:
+        for ticker, thesis in sorted(theses.items()):
+            company = thesis.get("company", {})
+            buy = thesis.get("buy_thesis", {})
+
+            ticker_html = escape(str(ticker))
+            final_status = escape(str(thesis.get("final_status", "UNKNOWN")))
+            css_class = status_class(final_status)
+
+            research_conf = buy.get("research_confidence", "")
+            quant_strength = buy.get("quant_strength", "")
+            pm_size = buy.get("pm_size_pct", "")
+
+            research_reasoning = escape(str(buy.get("research_reasoning", "")))
+            quant_reasoning = escape(str(buy.get("quant_reasoning", "")))
+            pm_reasoning = escape(str(buy.get("pm_reasoning", "")))
+
+            risk_reasons = buy.get("risk_reasons", [])
+            if isinstance(risk_reasons, list) and risk_reasons:
+                risk_html = "<ul>" + "".join(
+                    f"<li>{escape(str(reason))}</li>"
+                    for reason in risk_reasons[:5]
+                ) + "</ul>"
+            else:
+                risk_html = "<span class='muted'>None</span>"
+
+            rows += f"""
+            <tr>
+                <td><b>{ticker_html}</b></td>
+                <td>{escape(str(company.get("name", ticker_html)))}</td>
+                <td>{escape(str(company.get("sector", "Unknown")))}</td>
+                <td>{badge(final_status, css_class)}</td>
+                <td>Research: {research_conf}<br>Quant: {quant_strength}<br>Size: {pm_size}%</td>
+                <td>
+                    <b>Research:</b> {research_reasoning}<br><br>
+                    <b>Quant:</b> {quant_reasoning}
+                </td>
+                <td>{pm_reasoning}</td>
+                <td>{risk_html}</td>
+            </tr>
+            """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Trade Theses</title>
+        {shared_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a> | <a href="/positions/ai">AI Position Review</a></p>
+
+        <div class="page-header">
+            <h1>Trade Thesis Memory</h1>
+            <p class="subtitle">
+                Saved original buy theses from Deep Review. The Sell Analyst uses this to decide
+                whether a current holding still deserves to be held.
+            </p>
+        </div>
+
+        <section class="card">
+            <h2>Saved Theses</h2>
+            <p class="muted small">Last updated: {escape(str(data.get("updated_at")))}</p>
+
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Status</th>
+                    <th>Scores</th>
+                    <th>Research / Quant Thesis</th>
+                    <th>PM Reasoning</th>
+                    <th>Risk Notes</th>
+                </tr>
+                {rows}
+            </table>
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
