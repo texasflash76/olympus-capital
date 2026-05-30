@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import escape
 
 from fastapi import FastAPI, Form, Request
@@ -17,10 +17,11 @@ from recommender import run_recommender
 from tools.broker import (
     get_account_summary as fetch_account_summary,
     get_positions as fetch_positions,
+    submit_paper_market_order,
 )
-from tools.web_research import get_web_research
+from tools.web_research import get_web_research, get_company_profile
 from fast_scan import run_fast_scan, get_fast_scan_results, get_fast_scan_status
-from deep_review import run_deep_review, get_deep_review_results, get_deep_review_status
+from deep_review import run_deep_review, get_deep_review_results, get_deep_review_status, select_candidates_for_deep_review
 from performance_tracker import (
     PERFORMANCE_STATUS_PATH,
     update_performance,
@@ -64,6 +65,14 @@ ACCOUNT_CACHE = {
 ACCOUNT_CACHE_SECONDS = 60
 
 sector_lock = threading.Lock()
+
+TRADE_TEST_STATUS_PATH = Path("trade_test_status.json")
+POSITION_REVIEW_STATUS_PATH = Path("position_review_status.json")
+AI_POSITION_REVIEW_STATUS_PATH = Path("ai_position_review_status.json")
+
+trade_test_lock = threading.Lock()
+position_review_lock = threading.Lock()
+ai_position_review_lock = threading.Lock()
 
 
 def now_iso():
@@ -163,6 +172,576 @@ def parse_max_symbols(value: str):
         return None
 
     return int(value)
+
+
+def is_running_status(status):
+    return str(status or "").lower() in ["running", "starting", "queued"]
+
+
+def task_percent(status):
+    try:
+        if "percent" in status:
+            return max(0, min(100, float(status.get("percent") or 0)))
+
+        current = float(status.get("current") or 0)
+        total = float(status.get("total") or 0)
+
+        if total > 0:
+            return max(0, min(100, (current / total) * 100))
+
+    except Exception:
+        pass
+
+    return 0
+
+
+def render_task_status(title, status):
+    status = status or {}
+    state = str(status.get("status", "not_started"))
+    message = str(status.get("message", "No task has started yet."))
+    current = status.get("current", 0)
+    total = status.get("total", 0)
+    current_ticker = status.get("current_ticker")
+    error = status.get("error")
+    percent = task_percent(status)
+    running = is_running_status(state)
+
+    spinner = '<span class="spinner"></span>' if running else ""
+    refresh_note = "<p class='muted small'>This page auto-refreshes while the task is running.</p>" if running else ""
+
+    ticker_line = ""
+    if current_ticker:
+        ticker_line = f"<p class='muted small'>Now reviewing: <b>{escape(str(current_ticker))}</b></p>"
+
+    progress_line = ""
+    if total:
+        progress_line = f"<p class='muted small'>Progress: {escape(str(current))} / {escape(str(total))}</p>"
+
+    error_line = ""
+    if error:
+        error_line = f"<p class='danger-callout'>Error: {escape(str(error))}</p>"
+
+    return f"""
+        <div class="task-status">
+            <div class="task-head">
+                <div>
+                    <b>{spinner}{escape(str(title))}</b>
+                    <p class="muted small" style="margin:6px 0 0 0;">{escape(message)}</p>
+                </div>
+                <div>{badge(state, status_class(state))}</div>
+            </div>
+
+            <div class="progress-shell">
+                <div class="progress-bar" style="width: {percent:.1f}%;"></div>
+            </div>
+
+            <p><b>{percent:.1f}%</b> complete</p>
+            {progress_line}
+            {ticker_line}
+            {error_line}
+            {refresh_note}
+        </div>
+    """
+
+
+def term(label, definition):
+    return f'<span class="term" title="{escape(definition)}">{escape(label)}</span>'
+
+
+def render_stock_glossary():
+    terms = [
+        ("RSI", "Relative Strength Index. A momentum reading from 0 to 100. Above 70 can mean overbought; below 30 can mean oversold."),
+        ("MACD", "Moving Average Convergence Divergence. A trend/momentum indicator comparing short-term and long-term moving averages."),
+        ("Volume Ratio", "Today/recent volume compared with normal volume. Higher means more market participation."),
+        ("Bollinger Bands", "Price bands around a moving average. Price near the outer bands can mean stretched movement."),
+        ("PM", "Portfolio Manager agent. This is the final AI decision layer before risk checks."),
+        ("Risk Approved", "Whether the risk engine allowed the idea based on position size, exposure, drawdown, and safety rules."),
+        ("Unrealized P/L", "Profit or loss on an open position that has not been sold yet."),
+        ("Conviction", "How strong the combined research and technical evidence is."),
+    ]
+
+    cards = ""
+
+    for label, definition in terms:
+        cards += f"""
+            <div class="glossary-item">
+                <b>{escape(label)}</b>
+                <p class="muted small">{escape(definition)}</p>
+            </div>
+        """
+
+    return f"""
+        <section class="card">
+            <h2>Plain-English Stock Term Guide</h2>
+            <p class="muted small">
+                Hover over dotted terms in tables, or use these quick definitions.
+            </p>
+            <div class="glossary-grid">
+                {cards}
+            </div>
+        </section>
+    """
+
+
+def run_ticker_background(ticker, notional_value=100):
+    with trade_test_lock:
+        write_json(TRADE_TEST_STATUS_PATH, {
+            "status": "running",
+            "message": f"Submitting user-directed paper trade for {ticker}.",
+            "current": 0,
+            "total": 1,
+            "percent": 0,
+            "current_ticker": ticker,
+            "started_at": now_iso(),
+            "finished_at": None,
+            "error": None,
+        })
+
+        try:
+            order = submit_paper_market_order(
+                ticker=ticker,
+                direction="long",
+                notional_value=float(notional_value),
+            )
+
+            write_json(TRADE_TEST_STATUS_PATH, {
+                "status": "complete",
+                "message": f"Paper buy order submitted for {ticker}.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "current_ticker": None,
+                "started_at": None,
+                "finished_at": now_iso(),
+                "error": None,
+                "order": order,
+            })
+
+        except Exception as e:
+            write_json(TRADE_TEST_STATUS_PATH, {
+                "status": "error",
+                "message": f"Paper trade failed for {ticker}.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "current_ticker": None,
+                "finished_at": now_iso(),
+                "error": str(e),
+            })
+
+
+def run_position_review_background():
+    with position_review_lock:
+        write_json(POSITION_REVIEW_STATUS_PATH, {
+            "status": "running",
+            "message": "Reviewing open positions.",
+            "current": 0,
+            "total": 1,
+            "percent": 0,
+            "started_at": now_iso(),
+            "error": None,
+        })
+
+        try:
+            review_all_positions()
+            write_json(POSITION_REVIEW_STATUS_PATH, {
+                "status": "complete",
+                "message": "Position review complete.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "finished_at": now_iso(),
+                "error": None,
+            })
+        except Exception as e:
+            write_json(POSITION_REVIEW_STATUS_PATH, {
+                "status": "error",
+                "message": "Position review failed.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "finished_at": now_iso(),
+                "error": str(e),
+            })
+
+
+def run_ai_position_review_background():
+    with ai_position_review_lock:
+        write_json(AI_POSITION_REVIEW_STATUS_PATH, {
+            "status": "running",
+            "message": "Running AI sell/hold review for open positions.",
+            "current": 0,
+            "total": 1,
+            "percent": 0,
+            "started_at": now_iso(),
+            "error": None,
+        })
+
+        try:
+            run_ai_position_review(force_refresh_positions=True)
+            write_json(AI_POSITION_REVIEW_STATUS_PATH, {
+                "status": "complete",
+                "message": "AI position review complete.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "finished_at": now_iso(),
+                "error": None,
+            })
+        except Exception as e:
+            write_json(AI_POSITION_REVIEW_STATUS_PATH, {
+                "status": "error",
+                "message": "AI position review failed.",
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "finished_at": now_iso(),
+                "error": str(e),
+            })
+
+
+
+
+
+def premium_ui_css():
+    return """
+    <style>
+        :root {
+            --premium-bg: #030712;
+            --premium-panel: rgba(8, 13, 28, 0.82);
+            --premium-panel-2: rgba(15, 23, 42, 0.72);
+            --premium-border: rgba(148, 163, 184, 0.16);
+            --premium-border-strong: rgba(96, 165, 250, 0.34);
+            --premium-text: #f8fafc;
+            --premium-muted: #9ca3af;
+            --premium-blue: #60a5fa;
+            --premium-cyan: #22d3ee;
+            --premium-green: #34d399;
+            --premium-purple: #a78bfa;
+        }
+
+        body {
+            background:
+                radial-gradient(circle at 18% 8%, rgba(96, 165, 250, 0.18), transparent 28%),
+                radial-gradient(circle at 82% 14%, rgba(34, 211, 238, 0.13), transparent 28%),
+                radial-gradient(circle at 48% 95%, rgba(167, 139, 250, 0.10), transparent 30%),
+                linear-gradient(180deg, #030712 0%, #07111f 45%, #020617 100%) !important;
+            color: var(--premium-text) !important;
+            letter-spacing: -0.01em;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+            background-size: 44px 44px;
+            mask-image: linear-gradient(to bottom, rgba(0,0,0,0.55), transparent 75%);
+            z-index: -1;
+        }
+
+        .page-header {
+            position: relative;
+        }
+
+        .page-header::after {
+            content: "";
+            display: block;
+            height: 1px;
+            width: 100%;
+            margin-top: 22px;
+            background: linear-gradient(90deg, transparent, rgba(96,165,250,0.55), rgba(52,211,153,0.40), transparent);
+        }
+
+        h1 {
+            background: linear-gradient(135deg, #ffffff 0%, #bfdbfe 35%, #67e8f9 72%, #ffffff 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent !important;
+            text-shadow: 0 0 34px rgba(96, 165, 250, 0.14);
+        }
+
+        h2, h3 {
+            color: #f8fafc !important;
+        }
+
+        .subtitle, .muted, .small {
+            color: #a7b3c7 !important;
+        }
+
+        .card,
+        .card-soft,
+        .allocation-card,
+        .chart-card {
+            background:
+                linear-gradient(180deg, rgba(15, 23, 42, 0.82), rgba(2, 6, 23, 0.76)) !important;
+            border: 1px solid var(--premium-border) !important;
+            box-shadow:
+                0 24px 70px rgba(0, 0, 0, 0.38),
+                inset 0 1px 0 rgba(255, 255, 255, 0.035) !important;
+            backdrop-filter: blur(22px) saturate(135%) !important;
+            -webkit-backdrop-filter: blur(22px) saturate(135%) !important;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::before,
+        .allocation-card::before,
+        .chart-card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(120deg, rgba(96,165,250,0.10), transparent 24%),
+                radial-gradient(circle at top right, rgba(34,211,238,0.08), transparent 30%);
+            opacity: 0.9;
+        }
+
+        .card > *,
+        .allocation-card > *,
+        .chart-card > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        .card:hover,
+        .allocation-card:hover,
+        .chart-card:hover,
+        .card-soft:hover {
+            border-color: var(--premium-border-strong) !important;
+            box-shadow:
+                0 28px 80px rgba(0, 0, 0, 0.45),
+                0 0 38px rgba(96, 165, 250, 0.08),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+        }
+
+        .metric-title {
+            color: #93c5fd !important;
+            letter-spacing: 0.12em !important;
+            font-weight: 850 !important;
+        }
+
+        .big-number {
+            color: #ffffff !important;
+            text-shadow: 0 0 24px rgba(96, 165, 250, 0.18);
+        }
+
+        .btn,
+        button {
+            border-radius: 999px !important;
+            border: 1px solid rgba(147, 197, 253, 0.20) !important;
+            background:
+                linear-gradient(135deg, rgba(37, 99, 235, 0.92), rgba(14, 165, 233, 0.82)) !important;
+            box-shadow:
+                0 14px 32px rgba(37, 99, 235, 0.22),
+                inset 0 1px 0 rgba(255,255,255,0.12) !important;
+            transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease !important;
+        }
+
+        .btn:hover,
+        button:hover {
+            transform: translateY(-2px) scale(1.01) !important;
+            box-shadow:
+                0 20px 42px rgba(37, 99, 235, 0.34),
+                0 0 24px rgba(34, 211, 238, 0.14),
+                inset 0 1px 0 rgba(255,255,255,0.18) !important;
+            filter: brightness(1.08) !important;
+        }
+
+        .btn-dark {
+            background:
+                linear-gradient(135deg, rgba(30, 41, 59, 0.94), rgba(15, 23, 42, 0.94)) !important;
+            border-color: rgba(148, 163, 184, 0.20) !important;
+        }
+
+        .btn-red {
+            background:
+                linear-gradient(135deg, rgba(220, 38, 38, 0.92), rgba(127, 29, 29, 0.92)) !important;
+        }
+
+        input, select {
+            background: rgba(2, 6, 23, 0.72) !important;
+            border: 1px solid rgba(148, 163, 184, 0.18) !important;
+            border-radius: 999px !important;
+            color: #f8fafc !important;
+        }
+
+        input:focus, select:focus {
+            border-color: rgba(96, 165, 250, 0.75) !important;
+            box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.13) !important;
+        }
+
+        table {
+            background: rgba(2, 6, 23, 0.58) !important;
+            border: 1px solid rgba(148, 163, 184, 0.14) !important;
+            border-radius: 18px !important;
+            overflow: hidden !important;
+        }
+
+        th {
+            background: rgba(15, 23, 42, 0.92) !important;
+            color: #bfdbfe !important;
+            font-weight: 900 !important;
+            letter-spacing: 0.09em !important;
+        }
+
+        td {
+            border-bottom: 1px solid rgba(148, 163, 184, 0.10) !important;
+        }
+
+        tr:hover td {
+            background: rgba(37, 99, 235, 0.10) !important;
+        }
+
+        .badge {
+            border-radius: 999px !important;
+            font-weight: 900 !important;
+            letter-spacing: 0.02em;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+
+        .approved {
+            background: rgba(16, 185, 129, 0.16) !important;
+            color: #bbf7d0 !important;
+            border-color: rgba(52, 211, 153, 0.32) !important;
+        }
+
+        .recommended {
+            background: rgba(34, 211, 238, 0.14) !important;
+            color: #a5f3fc !important;
+            border-color: rgba(34, 211, 238, 0.32) !important;
+        }
+
+        .blocked {
+            background: rgba(239, 68, 68, 0.15) !important;
+            color: #fecaca !important;
+            border-color: rgba(239, 68, 68, 0.34) !important;
+        }
+
+        .vetoed {
+            background: rgba(245, 158, 11, 0.14) !important;
+            color: #fde68a !important;
+            border-color: rgba(245, 158, 11, 0.32) !important;
+        }
+
+        .neutral {
+            background: rgba(96, 165, 250, 0.13) !important;
+            color: #dbeafe !important;
+            border-color: rgba(96, 165, 250, 0.28) !important;
+        }
+
+        .progress-shell {
+            height: 18px !important;
+            background: rgba(2, 6, 23, 0.82) !important;
+            border: 1px solid rgba(148, 163, 184, 0.16) !important;
+        }
+
+        .progress-bar {
+            background:
+                linear-gradient(90deg, #2563eb, #22d3ee, #34d399) !important;
+            box-shadow: 0 0 24px rgba(34, 211, 238, 0.32);
+        }
+
+        .line-svg polyline {
+            filter: drop-shadow(0 0 10px rgba(96, 165, 250, 0.55));
+        }
+
+        .portfolio-point {
+            filter: drop-shadow(0 0 8px rgba(147, 197, 253, 0.65));
+        }
+
+        .pie-wrap, .pie {
+            filter: drop-shadow(0 0 26px rgba(96, 165, 250, 0.12));
+        }
+
+        .success-callout,
+        .warning-callout,
+        .danger-callout,
+        .callout {
+            border-radius: 18px !important;
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+        }
+
+        ::selection {
+            background: rgba(96, 165, 250, 0.38);
+            color: white;
+        }
+
+        @media (max-width: 900px) {
+            body {
+                padding: 16px !important;
+            }
+
+            .card, .allocation-card {
+                padding: 18px !important;
+            }
+        }
+    
+        .ai-review-card {
+            background: rgba(2, 6, 23, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 18px;
+            padding: 18px;
+            margin: 16px 0;
+        }
+
+        .ai-review-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 14px;
+            margin-top: 12px;
+        }
+
+        .ai-review-box {
+            background: rgba(15, 23, 42, 0.62);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 14px;
+            padding: 14px;
+            line-height: 1.55;
+            max-height: none;
+            overflow: visible;
+            word-break: normal;
+            overflow-wrap: anywhere;
+        }
+
+        .ai-review-box h4 {
+            margin: 0 0 8px 0;
+            color: #bfdbfe;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        details.ai-details {
+            margin-top: 12px;
+        }
+
+        details.ai-details summary {
+            cursor: pointer;
+            color: #93c5fd;
+            font-weight: 900;
+            padding: 10px 0;
+        }
+
+        details.ai-details[open] summary {
+            margin-bottom: 10px;
+        }
+
+        .wide-readable {
+            white-space: normal !important;
+            max-width: 760px;
+            min-width: 320px;
+            line-height: 1.55;
+            overflow-wrap: anywhere;
+        }
+
+    </style>
+    """
 
 
 def shared_css():
@@ -594,6 +1173,60 @@ def shared_css():
             font-style: italic;
         }
 
+
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 3px solid rgba(148, 163, 184, 0.25);
+            border-top-color: #60a5fa;
+            border-radius: 999px;
+            display: inline-block;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .task-status {
+            margin-top: 14px;
+            padding: 14px 16px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            background: rgba(2, 6, 23, 0.62);
+        }
+
+        .task-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .term {
+            border-bottom: 1px dotted rgba(147, 197, 253, 0.75);
+            cursor: help;
+            color: #bfdbfe;
+            font-weight: 800;
+        }
+
+        .glossary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .glossary-item {
+            background: rgba(2, 6, 23, 0.58);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 12px;
+        }
+
         @media (max-width: 1000px) {
             .grid-4, .grid-3, .grid-2 {
                 grid-template-columns: 1fr;
@@ -648,6 +1281,7 @@ async def password_protect_dashboard(request: Request, call_next):
     <head>
         <title>Olympus Capital Login</title>
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <div style="max-width: 440px; margin: 90px auto;">
@@ -774,7 +1408,7 @@ def get_recent_trade_logs(limit=20):
 
 def get_today_trade_logs():
     today = datetime.now().date().isoformat()
-    logs = get_recent_trade_logs(limit=100)
+    logs = get_recent_trade_logs(limit=5)
 
     return [
         log for log in logs
@@ -1043,344 +1677,365 @@ def render_ticker_headlines(ticker: str):
     return html
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard_home():
-    account, positions = get_cached_account_and_positions()
 
-    save_portfolio_snapshot(account)
+# ===================== PORTFOLIO HOME UPGRADE HELPERS =====================
 
-    recent_logs = get_recent_trade_logs(limit=20)
-    today_logs = get_today_trade_logs()
-    portfolio_history = get_portfolio_history(limit=30)
-    summary = summarize_logs(today_logs)
-
-    paper_enabled = os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true"
-    paper_status = "Enabled" if paper_enabled else "Disabled"
-    paper_css = "approved" if paper_enabled else "vetoed"
-
-    position_rows = ""
-
-    if len(positions) == 0:
-        position_rows = "<p class='empty'>No open positions.</p>"
-    else:
-        rows = ""
-
-        for position in positions:
-            rows += f"""
-                <tr>
-                    <td>{escape(str(position.get("symbol", "")))}</td>
-                    <td>{escape(str(position.get("qty", "")))}</td>
-                    <td>{money(position.get("market_value", 0))}</td>
-                    <td>{money(position.get("unrealized_pl", 0))}</td>
-                </tr>
-            """
-
-        position_rows = f"""
-            <table>
-                <tr>
-                    <th>Symbol</th>
-                    <th>Qty</th>
-                    <th>Market Value</th>
-                    <th>Unrealized P/L</th>
-                </tr>
-                {rows}
-            </table>
-        """
-
-    log_rows = ""
-
-    if len(recent_logs) == 0:
-        log_rows = "<p class='empty'>No trade logs yet.</p>"
-    else:
-        rows = ""
-
-        for log in recent_logs:
-            pm_reasoning = log.get("pm_decision", {}).get("reasoning", "No PM reasoning found.")
-            risk_reasons = log.get("risk_result", {}).get("reasons", [])
-
-            risk_html = ""
-            if risk_reasons:
-                risk_html = "<ul>" + "".join(
-                    f"<li>{escape(str(reason))}</li>"
-                    for reason in risk_reasons
-                ) + "</ul>"
-            else:
-                risk_html = "<span class='empty'>No risk reasons found.</span>"
-
-            status = log.get("final_status", "")
-            css_class = status_class(status)
-            news_html = render_ticker_headlines(log.get("ticker", ""))
-
-            rows += f"""
-                <tr>
-                    <td>{log.get("id", "")}</td>
-                    <td>{escape(str(log.get("timestamp", "")))}</td>
-                    <td>{escape(str(log.get("ticker", "")))}</td>
-                    <td>{badge(status, css_class)}</td>
-                    <td>{escape(str(pm_reasoning))}</td>
-                    <td>{news_html}</td>
-                    <td>{risk_html}</td>
-                </tr>
-            """
-
-        log_rows = f"""
-            <table>
-                <tr>
-                    <th>ID</th>
-                    <th>Time</th>
-                    <th>Ticker</th>
-                    <th>Status</th>
-                    <th>PM Reasoning</th>
-                    <th>Recent Headlines</th>
-                    <th>Risk Result</th>
-                </tr>
-                {rows}
-            </table>
-        """
-
-    latest_raw = ""
-
-    if len(recent_logs) > 0:
-        latest = recent_logs[0]
-
-        latest_raw = f"""
-            <h2 class="section-title">Raw Latest Log Detail</h2>
-
-            <div class="card">
-                <h2>Research Brief</h2>
-                <pre>{escape(json.dumps(latest.get("research_brief", {}), indent=2))}</pre>
-
-                <h2>Quant Signal</h2>
-                <pre>{escape(json.dumps(latest.get("quant_signal", {}), indent=2))}</pre>
-
-                <h2>PM Decision</h2>
-                <pre>{escape(json.dumps(latest.get("pm_decision", {}), indent=2))}</pre>
-
-                <h2>Risk Result</h2>
-                <pre>{escape(json.dumps(latest.get("risk_result", {}), indent=2))}</pre>
-            </div>
-        """
-
-    chart_html = build_portfolio_chart(portfolio_history)
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Olympus Capital Dashboard</title>
-        {shared_css()}
-    </head>
-
-    <body>
-        <div class="page-header">
-            <h1>Olympus Capital Dashboard</h1>
-            <p class="subtitle">
-                Paper trading dashboard for market discovery, AI recommendations, single-ticker trade tests,
-                risk checks, portfolio state, and audit logs.
-            </p>
-        </div>
-
-        <div class="grid grid-4">
-            <div class="card">
-                <div class="metric-title">Portfolio Value</div>
-                <div class="big-number">{money(account.get("portfolio_value", 0))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Cash</div>
-                <div class="big-number">{money(account.get("cash", 0))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Buying Power</div>
-                <div class="big-number">{money(account.get("buying_power", 0))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Paper Trading</div>
-                <div class="big-number">{badge(paper_status, paper_css)}</div>
-                <p class="muted small">Single-ticker trade tests may submit paper orders only if enabled.</p>
-            </div>
-        </div>
-
-        <section class="card">
-            <h2>Discovery and Trading Tools</h2>
-            <p class="subtitle">
-                Use these tools in order. The screener finds technical setups, the recommender researches and ranks ideas,
-                and the single-ticker test is the only mode that may submit a paper trade.
-            </p>
-
-            <div class="button-row" style="margin-bottom: 18px;">
-                <a href="/fast-scan" class="btn btn-blue">Fast Scan</a>
-                <a href="/deep-review" class="btn btn-green">Deep AI Review</a>
-                <a href="/positions" class="btn btn-red">Position Monitor</a>
-                <a href="/performance" class="btn btn-dark">Performance Tracker</a>
-            </div>
-
-            <div class="tool-grid">
-                <div class="card-soft">
-                    <h3><span class="tool-number">1</span>Market Screener</h3>
-                    <p>
-                        Scans the tradable stock universe from Alpaca and finds stocks with strong technical setups.
-                    </p>
-                    <p class="muted small">
-                        Uses RSI, MACD, volume ratio, Bollinger Bands, and basic filters. This is only the first filter,
-                        not a final trade decision.
-                    </p>
-                    <div class="button-row">
-                        <a href="/screener-results" class="btn btn-blue">Open Screener</a>
-                    </div>
-                </div>
-
-                <div class="card-soft">
-                    <h3><span class="tool-number">2</span>Full AI Recommendation Scan</h3>
-                    <p>
-                        Takes top screener candidates and runs web research, Research Analyst, Quant Analyst,
-                        Portfolio Manager, and Risk Engine.
-                    </p>
-                    <p class="muted small">
-                        Use this to find ranked trade ideas with reasoning. This mode does not submit trades.
-                    </p>
-                    <div class="button-row">
-                        <a href="/recommendations" class="btn btn-green">Find Recommendations</a>
-                    </div>
-                </div>
-
-                <div class="card-soft">
-                    <h3><span class="tool-number">P</span>Performance Tracker</h3>
-                    <p>
-                        Tracks how past recommendations performed after they were generated.
-                    </p>
-                    <p class="muted small">
-                        Use this to measure win rate, average return, drawdown, and whether Olympus is actually finding useful ideas.
-                    </p>
-                    <div class="button-row">
-                        <a href="/performance" class="btn btn-blue">Open Performance</a>
-                        <a href="/positions/ai" class="btn btn-red">AI Position Review</a>
-                    </div>
-                </div>
-
-                <div class="card-soft">
-                    <h3><span class="tool-number">3</span>Sector Intelligence</h3>
-                    <p>
-                        Reviews sector-level sentiment and headlines so you can choose where to scan before running stock analysis.
-                    </p>
-                    <p class="muted small">
-                        Use this to decide whether Technology, Energy, Financials, Healthcare, or another sector has the strongest setup.
-                    </p>
-                    <div class="button-row">
-                        <a href="/sectors" class="btn btn-green">Open Sector Scanner</a>
-                    </div>
-                </div>
-
-                <div class="card-soft">
-                    <h3><span class="tool-number">4</span>Single-Ticker AI Trade Test</h3>
-                    <p>
-                        Submit one ticker to the full Olympus system and let the AI decide whether to trade or veto.
-                    </p>
-                    <p class="muted small">
-                        This is the execution-capable mode. If paper trading is enabled and the trade is approved,
-                        it may submit an Alpaca paper order.
-                    </p>
-                    <div class="button-row">
-                        <a href="#run-ticker" class="btn btn-red">Run Ticker Trade Test</a>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <section class="card" id="run-ticker">
-            <h2>Single-Ticker AI Trade Test</h2>
-            <div class="danger-callout">
-                This mode is different from the recommendation scan. Here, you submit one ticker, and Olympus runs the full
-                AI process. If PM and risk approve and PAPER_TRADING_ENABLED=true, this mode may submit an Alpaca paper order.
-            </div>
-
-            <form method="post" action="/run-ticker" style="margin-top: 16px;">
-                <input
-                    type="text"
-                    name="ticker"
-                    placeholder="Enter ticker, e.g. TSLA"
-                    required
-                >
-                <button type="submit">Run AI Trade Test</button>
-            </form>
-
-            <p class="muted small">
-                Flow: Research Analyst → Quant Analyst → Portfolio Manager → Risk Engine → optional paper execution → logged result.
-            </p>
-        </section>
-
-        <h2 class="section-title">Today's Decision Summary</h2>
-
-        <div class="grid grid-4">
-            <div class="card">
-                <div class="metric-title">Total Decisions</div>
-                <div class="big-number">{summary["total"]}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Recommended Only</div>
-                <div class="big-number">{summary["recommended"]}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Paper Submitted</div>
-                <div class="big-number">{summary["submitted"]}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Vetoed / Blocked / Errors</div>
-                <div class="big-number">{summary["vetoed"] + summary["blocked"] + summary["errors"]}</div>
-            </div>
-        </div>
-
-        <h2 class="section-title">Portfolio Performance Snapshot</h2>
-        <div class="card chart">
-            {chart_html}
-        </div>
-
-        <h2 class="section-title">Current Positions</h2>
-        <div class="card">
-            {position_rows}
-        </div>
-
-        <h2 class="section-title">Recent Agent Decisions</h2>
-        <div class="card">
-            {log_rows}
-        </div>
-
-        {latest_raw}
-    </body>
-    </html>
-    """
-
-    return HTMLResponse(content=html)
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
-@app.post("/run-ticker")
-def run_ticker(ticker: str = Form(...)):
-    ticker = ticker.strip().upper()
+def short_time(value):
+    raw = str(value or "")
+    if "T" in raw:
+        return raw.split("T")[0]
+    if " " in raw:
+        return raw.split(" ")[0]
+    return raw[:10]
 
-    if not ticker.isalnum() or len(ticker) > 10:
-        return HTMLResponse(
-            "<h2>Invalid ticker.</h2><p>Use symbols like NVDA, TSLA, AAPL.</p>",
-            status_code=400,
-        )
+
+def get_position_symbol(position):
+    return str(
+        position.get("symbol")
+        or position.get("ticker")
+        or position.get("asset")
+        or ""
+    ).upper().strip()
+
+
+def position_pl_pct(position):
+    market_value = safe_float(position.get("market_value"))
+    unrealized_pl = safe_float(position.get("unrealized_pl"))
+    cost_basis = market_value - unrealized_pl
+
+    if cost_basis <= 0:
+        return 0
+
+    return (unrealized_pl / cost_basis) * 100
+
+
+def get_company_profile_cache():
+    return read_json(Path("company_profile_cache.json"), {})
+
+
+def get_profile_for_ticker(ticker, cache):
+    ticker = str(ticker or "").upper().strip()
+    item = cache.get(ticker, {})
+
+    if not isinstance(item, dict):
+        return {}
+
+    # tools/web_research.py stores cache entries as:
+    # {"fetched_at": "...", "profile": {...}}
+    if isinstance(item.get("profile"), dict):
+        return item.get("profile", {})
+
+    # Older/direct cache format fallback.
+    return item
+
+
+def get_position_sector(ticker, cache):
+    ticker = str(ticker or "").upper().strip()
+    profile = get_profile_for_ticker(ticker, cache)
+
+    sector = (
+        profile.get("sector")
+        or profile.get("company_profile", {}).get("sector")
+        or ""
+    )
+
+    sector = str(sector or "").strip()
+
+    if sector and sector.lower() != "unknown":
+        return sector
+
+    # If the cache is missing or stale, do a live profile lookup.
+    # This uses the existing SEC submissions API first, then Yahoo fallback.
+    try:
+        live_profile = get_company_profile(ticker, use_cache=True)
+        live_sector = str(live_profile.get("sector") or "").strip()
+
+        if live_sector and live_sector.lower() != "unknown":
+            return live_sector
+
+    except Exception as e:
+        print(f"Could not resolve sector for {ticker}: {e}")
+
+    # Do not show "Unknown" on the allocation chart.
+    return "Other / Unclassified"
+
+
+def save_portfolio_snapshot(account):
+    try:
+        init_db()
+
+        portfolio_value = safe_float(account.get("portfolio_value"))
+        cash = safe_float(account.get("cash"))
+        buying_power = safe_float(account.get("buying_power"))
+
+        if portfolio_value <= 0:
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                portfolio_value REAL,
+                cash REAL,
+                buying_power REAL
+            )
+        """)
+
+        cur.execute("""
+            INSERT INTO portfolio_snapshots (
+                timestamp,
+                portfolio_value,
+                cash,
+                buying_power
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            now_iso(),
+            portfolio_value,
+            cash,
+            buying_power,
+        ))
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print(f"Could not save portfolio snapshot: {e}")
+
+
+def get_portfolio_history(limit=60):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                portfolio_value REAL,
+                cash REAL,
+                buying_power REAL
+            )
+        """)
+
+        cur.execute("""
+            SELECT timestamp, portfolio_value, cash, buying_power
+            FROM portfolio_snapshots
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+
+        return list(reversed(rows))
+
+    except Exception as e:
+        print(f"Could not load portfolio history: {e}")
+        return []
+
+
+
+
+def parse_iso_timestamp(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
 
     try:
-        run_one_ticker(ticker, allow_execution=True)
-        return RedirectResponse(url="/", status_code=303)
-    except Exception as e:
-        return HTMLResponse(
-            f"""
-            <h2>Trade cycle failed for {escape(ticker)}</h2>
-            <pre>{escape(str(e))}</pre>
-            <p><a href="/">Back to dashboard</a></p>
-            """,
-            status_code=500,
-        )
+        raw = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
+
+def format_chart_timestamp(value):
+    dt = parse_iso_timestamp(value)
+    if not dt:
+        return str(value or "")
+
+    try:
+        return dt.strftime("%Y-%m-%d %I:%M %p UTC")
+    except Exception:
+        return str(value or "")
+
+
+def filter_history_by_range(history, chart_range="1M"):
+    if not history:
+        return history
+
+    chart_range = str(chart_range or "1M").upper().strip()
+    now = datetime.now(timezone.utc)
+
+    range_map = {
+        "1D": timedelta(days=1),
+        "1W": timedelta(days=7),
+        "1M": timedelta(days=30),
+        "3M": timedelta(days=90),
+        "ALL": None,
+    }
+
+    delta = range_map.get(chart_range, timedelta(days=30))
+
+    if delta is None:
+        return history
+
+    cutoff = now - delta
+    filtered = []
+
+    for item in history:
+        dt = parse_iso_timestamp(item.get("timestamp"))
+        if dt and dt >= cutoff:
+            filtered.append(item)
+
+    # If the selected range has no points, show recent history instead of a blank chart.
+    if filtered:
+        return filtered
+
+    return history[-min(len(history), 30):]
+
+
+def build_chart_range_buttons(selected_range="1M"):
+    selected_range = str(selected_range or "1M").upper().strip()
+    options = ["1D", "1W", "1M", "3M", "ALL"]
+    buttons = ""
+
+    for option in options:
+        btn_class = "btn btn-blue" if option == selected_range else "btn btn-dark"
+        buttons += f'<a class="{btn_class}" href="/?chart_range={option}">{option}</a>'
+
+    return f"""
+        <div class="button-row" style="margin-bottom: 14px;">
+            {buttons}
+        </div>
+    """
+
+def build_portfolio_line_chart(history, selected_range="1M"):
+    if not history:
+        return "<p class='empty'>No portfolio snapshots yet. Reload the dashboard over time to build the graph.</p>"
+
+    points = []
+
+    for item in history:
+        points.append({
+            "timestamp": item.get("timestamp", ""),
+            "value": safe_float(item.get("portfolio_value")),
+        })
+
+    if len(points) == 1:
+        points = points * 2
+
+    values = [p["value"] for p in points]
+    min_v = min(values)
+    max_v = max(values)
+    spread = max(max_v - min_v, 1)
+
+    width = 760
+    height = 260
+    pad_x = 38
+    pad_y = 28
+
+    coords = []
+
+    for i, point in enumerate(points):
+        x = pad_x + (i / max(len(points) - 1, 1)) * (width - pad_x * 2)
+        y = height - pad_y - ((point["value"] - min_v) / spread) * (height - pad_y * 2)
+        coords.append((x, y, point))
+
+    polyline = " ".join([f"{x:.1f},{y:.1f}" for x, y, point in coords])
+    area_points = f"{pad_x},{height-pad_y} " + polyline + f" {width-pad_x},{height-pad_y}"
+
+    hover_zones = ""
+    point_markers = ""
+
+    for i, (x, y, point) in enumerate(coords):
+        ts = str(point["timestamp"])
+        value = point["value"]
+        tooltip = escape(f"{format_chart_timestamp(ts)} | Portfolio value: {money(value)}")
+
+        if i == 0:
+            left_x = pad_x
+        else:
+            left_x = (coords[i - 1][0] + x) / 2
+
+        if i == len(coords) - 1:
+            right_x = width - pad_x
+        else:
+            right_x = (x + coords[i + 1][0]) / 2
+
+        zone_width = max(right_x - left_x, 8)
+
+        hover_zones += f"""
+            <rect x="{left_x:.1f}" y="{pad_y}" width="{zone_width:.1f}" height="{height - pad_y * 2}"
+                  fill="transparent">
+                <title>{tooltip}</title>
+            </rect>
+        """
+
+        point_markers += f"""
+            <circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#93c5fd">
+                <title>{tooltip}</title>
+            </circle>
+        """
+
+    start_value = points[0]["value"]
+    end_value = points[-1]["value"]
+    change = end_value - start_value
+    change_pct = (change / start_value * 100) if start_value else 0
+    change_class = "approved" if change >= 0 else "blocked"
+
+    selected_range = escape(str(selected_range or "1M").upper())
+
+    return f"""
+        <div class="chart-card">
+            <div class="chart-header" style="display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+                <div>
+                    <div class="metric-title">Portfolio Value Over Time · {selected_range}</div>
+                    <div class="big-number">{money(end_value)}</div>
+                    <div class="muted small">From {money(start_value)} to {money(end_value)}</div>
+                </div>
+                <div>{badge(f"{change:+,.2f} / {change_pct:+.1f}%", change_class)}</div>
+            </div>
+
+            <svg class="line-svg" viewBox="0 0 {width} {height}" preserveAspectRatio="none" style="width:100%; height:260px;">
+                <defs>
+                    <linearGradient id="portfolioFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.35"/>
+                        <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.02"/>
+                    </linearGradient>
+                </defs>
+
+                <line x1="{pad_x}" y1="{height-pad_y}" x2="{width-pad_x}" y2="{height-pad_y}" stroke="rgba(148,163,184,0.35)" />
+                <line x1="{pad_x}" y1="{pad_y}" x2="{pad_x}" y2="{height-pad_y}" stroke="rgba(148,163,184,0.20)" />
+
+                <polygon points="{area_points}" fill="url(#portfolioFill)" />
+                <polyline points="{polyline}" fill="none" stroke="#60a5fa" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+
+                {point_markers}
+                {hover_zones}
+            </svg>
+
+            <p class="muted small">
+                Hover over any dot or vertical area of the chart to see the exact timestamp and portfolio value.
+            </p>
+        </div>
+    """
 
 @app.post("/run-screener")
 def run_screener_route(
@@ -1491,6 +2146,7 @@ def screener_results_page():
         <title>Olympus Screener Results</title>
         {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -1511,18 +2167,8 @@ def screener_results_page():
                 The Full AI Recommendation Scan will later research and rank these kinds of candidates.
             </div>
 
-            <p style="margin-top:16px;">{badge(scan_status, status_class(scan_status))}</p>
-            <p><b>{pct(percent)}</b> complete</p>
-
-            <div class="progress-shell">
-                <div class="progress-bar" style="width: {percent}%;"></div>
-            </div>
-
-            <p>{escape(str(current))} / {escape(str(total))} stocks scanned</p>
-            <p>Current ticker: {escape(str(current_ticker))}</p>
-            <p>Message: {escape(str(message))}</p>
+            {render_task_status("Market Screener", status)}
             <p class="muted">Generated At: {escape(str(results.get("generated_at")))}</p>
-            <p>Error: {escape(str(status.get("error")))}</p>
 
             <form method="post" action="/run-screener">
                 <label>Top N:</label>
@@ -1553,9 +2199,9 @@ def screener_results_page():
                     <th>Ticker</th>
                     <th>Score</th>
                     <th>Close</th>
-                    <th>RSI</th>
-                    <th>MACD</th>
-                    <th>Volume Ratio</th>
+                    <th><span class="term" title="Relative Strength Index. Momentum from 0 to 100. Above 70 can be overbought; below 30 can be oversold.">RSI</span></th>
+                    <th><span class="term" title="Moving Average Convergence Divergence. Trend/momentum signal based on moving averages.">MACD</span></th>
+                    <th><span class="term" title="Current volume compared with normal volume. Higher means more participation.">Volume Ratio</span></th>
                     <th>Reasoning</th>
                 </tr>
                 {rows}
@@ -1802,6 +2448,7 @@ def recommendations_page():
         <title>Olympus AI Recommendations</title>
         {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -1886,7 +2533,7 @@ def recommendations_page():
                     <th>Research Confidence</th>
                     <th>Quant Strength</th>
                     <th>PM Decision</th>
-                    <th>Risk Approved</th>
+                    <th><span class="term" title="Whether the risk engine allowed the trade after safety checks.">Risk Approved</span></th>
                     <th>Sector</th>
                     <th>Market Mood</th>
                     <th>Reasoning</th>
@@ -2189,6 +2836,7 @@ def sectors_page():
         <title>Olympus Sector Intelligence</title>
         {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -2270,9 +2918,9 @@ def sectors_page():
                     <th>Industry</th>
                     <th>Score</th>
                     <th>Close</th>
-                    <th>RSI</th>
-                    <th>MACD</th>
-                    <th>Volume Ratio</th>
+                    <th><span class="term" title="Relative Strength Index. Momentum from 0 to 100. Above 70 can be overbought; below 30 can be oversold.">RSI</span></th>
+                    <th><span class="term" title="Moving Average Convergence Divergence. Trend/momentum signal based on moving averages.">MACD</span></th>
+                    <th><span class="term" title="Current volume compared with normal volume. Higher means more participation.">Volume Ratio</span></th>
                     <th>Reasoning</th>
                 </tr>
                 {candidate_rows}
@@ -2399,6 +3047,7 @@ def performance_page():
     <head>
         <title>Olympus Performance Tracker</title>
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -2563,64 +3212,142 @@ def run_fast_scan_route(
     return RedirectResponse(url="/fast-scan", status_code=303)
 
 
+
+
+def get_deep_review_candidate_map(max_candidates=8):
+    """
+    Returns tickers selected for Deep AI Review from the latest Fast Scan results.
+
+    Example:
+    {
+        "AAPL": 1,
+        "NVDA": 2
+    }
+    """
+    try:
+        selection = select_candidates_for_deep_review(
+            max_candidates=max_candidates,
+            only_quality_approved=True,
+            include_previous_errors=True,
+        )
+
+        selected = selection.get("selected", []) or []
+        output = {}
+
+        for idx, item in enumerate(selected, start=1):
+            ticker = str(item.get("ticker", "")).upper().strip()
+            if ticker:
+                output[ticker] = idx
+
+        return output
+
+    except Exception as e:
+        print(f"Could not build deep review candidate map: {e}")
+        return {}
+
+
+def get_deep_review_suggestions_html(max_candidates=8):
+    """
+    Builds the green candidate box on /deep-review.
+    Safe fallback if Fast Scan has not been run yet.
+    """
+    try:
+        selection = select_candidates_for_deep_review(
+            max_candidates=max_candidates,
+            only_quality_approved=True,
+            include_previous_errors=True,
+        )
+
+        tickers = [
+            str(t).upper().strip()
+            for t in selection.get("selected_tickers", [])
+            if t
+        ]
+
+        if not tickers:
+            return """
+                <div class="warning-callout">
+                    No eligible Fast Scan candidates found yet. Run Fast Scan first.
+                </div>
+            """
+
+        chips = " ".join([
+            f"<span class='badge approved'>{escape(ticker)}</span>"
+            for ticker in tickers
+        ])
+
+        return f"""
+            <div class="success-callout">
+                <b>Auto-selected from Fast Scan:</b>
+                <div style="margin-top:10px;">{chips}</div>
+                <p class="small muted" style="margin-bottom:0;">
+                    Leave the manual ticker box blank and Deep AI Review will use these automatically.
+                </p>
+            </div>
+        """
+
+    except Exception as e:
+        return f"""
+            <div class="warning-callout">
+                Could not load Fast Scan candidates yet: {escape(str(e))}
+            </div>
+        """
+
 @app.get("/fast-scan", response_class=HTMLResponse)
 def fast_scan_page():
-    status = get_fast_scan_status()
     results = get_fast_scan_results()
+    status = get_fast_scan_status()
+    candidates = results.get("candidates", []) or []
 
-    candidates = results.get("candidates", [])
-    summary = results.get("summary", {})
-
-    sector_options = '<option value="">All</option>'
-
-    try:
-        for sector in CANONICAL_SECTORS:
-            selected = "selected" if sector == results.get("sector") else ""
-            sector_options += f'<option value="{escape(sector)}" {selected}>{escape(sector)}</option>'
-    except Exception:
-        pass
+    deep_review_candidate_map = get_deep_review_candidate_map(max_candidates=8)
 
     rows = ""
 
     for item in candidates:
         ticker = escape(str(item.get("ticker", "")))
-        company = escape(str(item.get("company_name", "")))
+        ticker_raw = str(item.get("ticker", "")).upper().strip()
+        company = escape(str(item.get("company_name", item.get("name", ""))))
         sector = escape(str(item.get("sector", "")))
         industry = escape(str(item.get("industry", "")))
-        score = escape(str(item.get("screener_score", "")))
-        quality = item.get("quality_review", {})
-        quality_approved = quality.get("approved")
-        quality_label = "approved" if quality_approved else "rejected"
-        quality_css = "approved" if quality_approved else "blocked"
+
+        score = item.get("score")
+        if score is None:
+            score = item.get("fast_scan_score", item.get("candidate_score", ""))
+        score = escape(str(score))
+
+        technicals = item.get("technical_summary", {}) or {}
+        close = escape(str(
+            item.get("close")
+            or technicals.get("close")
+            or technicals.get("latest_close")
+            or ""
+        ))
+        rsi = escape(str(technicals.get("rsi", item.get("rsi", ""))))
+        volume_ratio = escape(str(technicals.get("volume_ratio", item.get("volume_ratio", ""))))
+
+        quality = item.get("quality_review", {}) or {}
+        approved = bool(quality.get("approved"))
+        quality_label = "approved" if approved else "rejected"
+        quality_css = "approved" if approved else "blocked"
 
         reasons = quality.get("reasons", [])
-        warnings = quality.get("warnings", [])
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
 
-        reason_html = ""
+        reason_html = "<br>".join([escape(str(r)) for r in reasons[:3]]) if reasons else ""
 
-        if reasons:
-            reason_html += "<b>Reasons</b><ul>" + "".join(
-                f"<li>{escape(str(reason))}</li>"
-                for reason in reasons
-            ) + "</ul>"
-
-        if warnings:
-            reason_html += "<b>Warnings</b><ul>" + "".join(
-                f"<li>{escape(str(warning))}</li>"
-                for warning in warnings
-            ) + "</ul>"
-
-        if not reason_html:
-            reason_html = "<span class='empty'>No major quality issues.</span>"
-
-        summary_data = item.get("technical_summary", {})
-        close = escape(str(summary_data.get("close", "")))
-        rsi = escape(str(summary_data.get("rsi", "")))
-        volume_ratio = escape(str(summary_data.get("volume_ratio", "")))
+        deep_rank = deep_review_candidate_map.get(ticker_raw)
+        if deep_rank:
+            deep_scan_html = f"{badge('validated for deep scan', 'approved')}<div class='muted small'>Deep scan rank #{deep_rank}</div>"
+            row_style = " style='box-shadow: inset 4px 0 0 rgba(34, 197, 94, 0.85);'"
+        else:
+            deep_scan_html = "<span class='muted small'>not moving on</span>"
+            row_style = ""
 
         rows += f"""
-        <tr>
+        <tr{row_style}>
             <td><b>{ticker}</b></td>
+            <td>{deep_scan_html}</td>
             <td>{company}</td>
             <td>{sector}</td>
             <td>{industry}</td>
@@ -2635,12 +3362,9 @@ def fast_scan_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="9">No fast scan candidates yet.</td>
+            <td colspan="10">No fast scan candidates yet.</td>
         </tr>
         """
-
-    scan_status = escape(str(status.get("status", "not_started")))
-    scan_message = escape(str(status.get("message", "")))
 
     refresh_tag = ""
     if status.get("status") == "running":
@@ -2653,6 +3377,7 @@ def fast_scan_page():
         <title>Olympus Fast Scan</title>
         {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -2660,71 +3385,34 @@ def fast_scan_page():
         <div class="page-header">
             <h1>Fast Scan</h1>
             <p class="subtitle">
-                Fast Scan uses sector, screener, and quality filters only. It does not run the full LLM review.
-                Use this first, then send selected tickers to Deep AI Review.
+                Fast Scan ranks stocks quantitatively first. Rows with the green
+                <b>validated for deep scan</b> badge are automatically moved into Deep AI Review
+                if you leave the Deep Review ticker box blank.
             </p>
         </div>
 
-        <div class="card">
+        <section class="card">
             <h2>Run Fast Scan</h2>
-            <p>{badge(scan_status, status_class(scan_status))}</p>
-            <p>{scan_message}</p>
 
-            <form method="post" action="/run-fast-scan">
-                <label>Top candidates:</label>
-                <input type="number" name="top_n" value="50" min="5" max="200">
+            {render_task_status("Fast Scan", status)}
 
-                <label>Max symbols:</label>
-                <input type="text" name="max_symbols" value="500">
-
-                <label>Sector:</label>
-                <select name="sector">
-                    {sector_options}
-                </select>
-
-                <label>
-                    <input type="checkbox" name="only_quality_approved">
-                    Only quality approved
-                </label>
-
+            <form method="post" action="/run-fast-scan" class="loading-form">
+                <input type="number" name="top_n" value="25" min="1" max="200">
+                <input type="text" name="max_symbols" placeholder="max symbols, or all">
                 <button type="submit">Run Fast Scan</button>
             </form>
-        </div>
+        </section>
 
-        <div class="grid grid-4">
-            <div class="card">
-                <div class="metric-title">Candidates</div>
-                <div class="big-number">{escape(str(summary.get("total_candidates", 0)))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Quality Approved</div>
-                <div class="big-number">{escape(str(summary.get("quality_approved", 0)))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Quality Rejected</div>
-                <div class="big-number">{escape(str(summary.get("quality_rejected", 0)))}</div>
-            </div>
-
-            <div class="card">
-                <div class="metric-title">Generated</div>
-                <div class="big-number" style="font-size:18px;">{escape(str(results.get("generated_at")))}</div>
-            </div>
-        </div>
-
-        <div class="card">
+        <section class="card">
             <h2>Fast Scan Candidates</h2>
-            <p class="muted small">
-                Copy tickers you like into Deep AI Review.
-            </p>
             <table>
                 <tr>
                     <th>Ticker</th>
+                    <th>Deep Scan</th>
                     <th>Company</th>
                     <th>Sector</th>
                     <th>Industry</th>
-                    <th>Score</th>
+                    <th>Fast Scan Score</th>
                     <th>Close</th>
                     <th>RSI</th>
                     <th>Volume Ratio</th>
@@ -2732,41 +3420,30 @@ def fast_scan_page():
                 </tr>
                 {rows}
             </table>
-        </div>
+        </section>
     </body>
     </html>
     """
 
-    return HTMLResponse(content=html)
-
-
-def run_deep_review_background(tickers, allow_execution=False):
-    if deep_review_lock.locked():
-        return
-
-    with deep_review_lock:
-        run_deep_review(
-            tickers=tickers,
-            allow_execution=allow_execution,
-        )
-
+    return HTMLResponse(html)
 
 @app.post("/run-deep-review")
 def run_deep_review_route(
-    tickers: str = Form(...),
-    allow_execution: str = Form("false"),
+    tickers: str = Form(""),
+    allow_execution: str = Form(None),
 ):
     if deep_review_lock.locked():
         return RedirectResponse(url="/deep-review", status_code=303)
 
-    allow_exec = str(allow_execution).lower() in ["true", "on", "1", "yes"]
+    parsed_tickers = [t.strip().upper() for t in str(tickers or "").replace("\n", ",").split(",") if t.strip()]
+    execute = bool(allow_execution)
+
+    # Blank ticker input means: automatically use best Fast Scan candidates.
+    tickers_for_review = parsed_tickers if parsed_tickers else None
 
     thread = threading.Thread(
         target=run_deep_review_background,
-        kwargs={
-            "tickers": tickers,
-            "allow_execution": allow_exec,
-        },
+        args=(tickers_for_review, execute),
         daemon=True,
     )
     thread.start()
@@ -2776,6 +3453,7 @@ def run_deep_review_route(
 
 @app.get("/deep-review", response_class=HTMLResponse)
 def deep_review_page():
+    deep_review_suggestions_html = get_deep_review_suggestions_html(max_candidates=8)
     status = get_deep_review_status()
     results = get_deep_review_results()
 
@@ -2834,6 +3512,7 @@ def deep_review_page():
         <title>Olympus Deep AI Review</title>
         {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -2847,11 +3526,11 @@ def deep_review_page():
 
         <div class="card">
             <h2>Run Deep AI Review</h2>
-            <p>{badge(review_status, status_class(review_status))}</p>
-            <p>{review_message}</p>
-            <p class="muted small">Progress: {current} / {total}</p>
+            {render_task_status("Deep AI Review", status)}
 
-            <form method="post" action="/run-deep-review">
+            {deep_review_suggestions_html}
+
+            <form method="post" action="/run-deep-review" class="loading-form">
                 <label>Tickers:</label>
                 <input
                     type="text"
@@ -2883,7 +3562,7 @@ def deep_review_page():
                     <th>Sector</th>
                     <th>Industry</th>
                     <th>Quant</th>
-                    <th>Risk Approved</th>
+                    <th><span class="term" title="Whether the risk engine allowed the trade after safety checks.">Risk Approved</span></th>
                     <th>Reasoning</th>
                 </tr>
                 {rows}
@@ -2979,12 +3658,23 @@ def positions_page(request: Request):
             </tr>
             """
 
+    status = read_json(POSITION_REVIEW_STATUS_PATH, {
+        "status": "not_started",
+        "message": "No position review is running.",
+    })
+
+    refresh_tag = ""
+    if is_running_status(status.get("status")):
+        refresh_tag = '<meta http-equiv="refresh" content="5">'
+
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Olympus Position Monitor</title>
+        {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a></p>
@@ -3043,7 +3733,7 @@ def positions_page(request: Request):
                     <th>Qty</th>
                     <th>Market Value</th>
                     <th>Entry / Current</th>
-                    <th>Unrealized P/L</th>
+                    <th><span class="term" title="Open profit or loss before selling the position.">Unrealized P/L</span></th>
                     <th>Technicals</th>
                     <th>Reasoning / News</th>
                     <th>Action</th>
@@ -3060,7 +3750,15 @@ def positions_page(request: Request):
 
 @app.post("/positions/review")
 def run_positions_review():
-    review_all_positions()
+    if position_review_lock.locked():
+        return RedirectResponse(url="/positions", status_code=303)
+
+    thread = threading.Thread(
+        target=run_position_review_background,
+        daemon=True,
+    )
+    thread.start()
+
     return RedirectResponse(url="/positions", status_code=303)
 
 
@@ -3085,115 +3783,145 @@ def sell_position_from_dashboard(
 
 
 @app.get("/positions/ai", response_class=HTMLResponse)
-def ai_positions_page(request: Request):
+def ai_position_review_page():
     data = get_ai_position_review()
-    reviews = data.get("reviews", [])
-    summary = data.get("summary", {})
+    summary = data.get("summary", {}) or {}
+    reviews = data.get("reviews", []) or []
     generated_at = data.get("generated_at")
-    llm_mode = data.get("llm_mode")
-    manual_prompt_file = data.get("manual_prompt_file")
+    llm_mode = data.get("llm_mode", "unknown")
 
-    rows = ""
+    status = read_json(AI_POSITION_REVIEW_STATUS_PATH, {
+        "status": "not_started",
+        "message": "No AI position review is running.",
+    })
 
-    if not reviews:
-        rows = """
-        <tr>
-            <td colspan="11">No AI position review has been run yet.</td>
-        </tr>
-        """
-    else:
-        for item in reviews:
-            ticker = escape(str(item.get("ticker", "")))
-            position_review = item.get("position_review", {})
-            position = position_review.get("position", {})
-            rule_decision = position_review.get("decision", {})
-            ai_decision = item.get("ai_decision", {})
+    refresh_tag = ""
+    if is_running_status(status.get("status")):
+        refresh_tag = '<meta http-equiv="refresh" content="5">'
 
-            ai_label = escape(str(ai_decision.get("decision", "UNKNOWN")))
-            rule_label = escape(str(rule_decision.get("decision", "UNKNOWN")))
+    cards = ""
 
-            css_class = status_class(ai_label)
+    for item in reviews:
+        ticker = escape(str(item.get("ticker", "")))
+        position_review = item.get("position_review", {}) or {}
+        position = position_review.get("position", {}) or {}
+        rule_decision = position_review.get("decision", {}) or {}
+        ai = item.get("ai_decision", {}) or {}
 
-            qty = position.get("qty", 0)
-            market_value = position.get("market_value", 0)
-            avg_entry = position.get("avg_entry_price", 0)
-            current_price = position.get("current_price", 0)
-            unrealized_pl = position.get("unrealized_pl", 0)
-            unrealized_plpc = float(position.get("unrealized_plpc", 0) or 0) * 100
+        ai_decision = escape(str(ai.get("decision", "UNKNOWN")).replace("_", " "))
+        ai_css = status_class(ai_decision)
+        confidence = safe_float(ai.get("confidence"))
+        sell_pct = safe_float(ai.get("sell_pct"))
+        estimated_qty_to_sell = safe_float(ai.get("estimated_qty_to_sell"))
+        reasoning = escape(str(ai.get("reasoning", "")))
+        rule_agreement = escape(str(ai.get("rule_agreement", "unknown")).replace("_", " "))
+        thesis_status = escape(str(ai.get("thesis_status", "unknown")).replace("_", " "))
+        profit_notes = escape(str(ai.get("profit_protection_notes", "")))
+        change_mind = escape(str(ai.get("what_would_change_my_mind", "")))
 
-            confidence = ai_decision.get("confidence", 0)
-            sell_pct = ai_decision.get("sell_pct", 0)
-            qty_to_sell = ai_decision.get("estimated_qty_to_sell", 0)
+        risk_flags = ai.get("risk_flags", [])
+        if not isinstance(risk_flags, list):
+            risk_flags = [str(risk_flags)]
+        risk_html = "".join([f"<li>{escape(str(flag))}</li>" for flag in risk_flags]) or "<li>No major AI risk flags listed.</li>"
 
-            reasoning = escape(str(ai_decision.get("reasoning", "")))
-            thesis_status = escape(str(ai_decision.get("thesis_status", "")))
-            rule_agreement = escape(str(ai_decision.get("rule_agreement", "")))
-            profit_notes = escape(str(ai_decision.get("profit_protection_notes", "")))
-            what_changes = escape(str(ai_decision.get("what_would_change_my_mind", "")))
+        rule_action = escape(str(rule_decision.get("action", rule_decision.get("decision", "unknown"))).replace("_", " "))
+        rule_reason = escape(str(rule_decision.get("reasoning", rule_decision.get("reason", ""))))
 
-            risk_flags = ai_decision.get("risk_flags", [])
+        qty = escape(str(position.get("qty", "")))
+        market_value = money(position.get("market_value", 0))
+        unrealized_pl = money(position.get("unrealized_pl", 0))
+        unrealized_plpc = pct(safe_float(position.get("unrealized_plpc", 0)) * 100)
+        avg_entry = money(position.get("avg_entry_price", 0))
+        current_price = money(position.get("current_price", position.get("market_price", 0)))
 
-            if isinstance(risk_flags, list) and risk_flags:
-                risk_flags_html = "<ul>" + "".join(
-                    f"<li>{escape(str(flag))}</li>"
-                    for flag in risk_flags
-                ) + "</ul>"
-            else:
-                risk_flags_html = "<span class='muted'>None</span>"
-
-            action_html = "<span class='muted'>No AI sell action</span>"
-
-            if ai_label in ["TRIM", "TAKE_PROFIT", "SELL", "CUT_LOSS"] and float(sell_pct or 0) > 0:
-                action_html = f"""
-                <form method="post" action="/positions/ai-sell">
+        sell_form = ""
+        if sell_pct > 0:
+            sell_form = f"""
+                <form method="post" action="/positions/ai-sell" style="margin-top:12px;">
                     <input type="hidden" name="ticker" value="{ticker}">
                     <input type="hidden" name="sell_pct" value="{sell_pct}">
-                    <button type="submit">Paper sell {sell_pct}%</button>
+                    <button type="submit" class="btn btn-red">
+                        Submit Suggested Paper Sell {sell_pct:.0f}%
+                    </button>
                 </form>
-                <p class="muted small">Estimated qty: {float(qty_to_sell):.6f}</p>
-                """
-
-            rows += f"""
-            <tr>
-                <td><b>{ticker}</b></td>
-                <td>{badge(ai_label, css_class)}</td>
-                <td>{badge(rule_label, status_class(rule_label))}</td>
-                <td>{confidence}</td>
-                <td>{qty}</td>
-                <td>{money(market_value)}</td>
-                <td>{money(avg_entry)} / {money(current_price)}</td>
-                <td>{money(unrealized_pl)}<br>{unrealized_plpc:.2f}%</td>
-                <td>
-                    <b>Thesis:</b> {thesis_status}<br>
-                    <b>Rule agreement:</b> {rule_agreement}<br>
-                    <b>Risks:</b> {risk_flags_html}
-                </td>
-                <td>
-                    <b>Reasoning:</b> {reasoning}<br><br>
-                    <b>Profit notes:</b> {profit_notes}<br><br>
-                    <b>What changes its mind:</b> {what_changes}
-                </td>
-                <td>{action_html}</td>
-            </tr>
             """
+        else:
+            sell_form = "<p class='muted small'>No sell order suggested by AI.</p>"
 
-    manual_note = ""
+        cards += f"""
+            <div class="ai-review-card">
+                <div style="display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+                    <div>
+                        <h2 style="margin-bottom:6px;">{ticker}</h2>
+                        <div class="button-row" style="margin-top:0;">
+                            {badge(ai_decision, ai_css)}
+                            {badge(f"Confidence {confidence:.0f}/100", "neutral")}
+                            {badge(f"Sell {sell_pct:.0f}%", "recommended" if sell_pct > 0 else "neutral")}
+                            {badge(f"Thesis {thesis_status}", "neutral")}
+                        </div>
+                    </div>
+                    <div>
+                        {sell_form}
+                    </div>
+                </div>
 
-    if manual_prompt_file:
-        manual_note = f"""
-        <div class="warning-callout" style="margin-top:16px;">
-            LLM_MODE is manual, so the dashboard did not call the AI directly.
-            Prompts were written to <b>{escape(str(manual_prompt_file))}</b>.
-            Set LLM_MODE=codex in .env if you want the dashboard to run AI sell reviews automatically.
-        </div>
+                <div class="ai-review-grid">
+                    <div class="ai-review-box">
+                        <h4>Position</h4>
+                        <p><b>Qty:</b> {qty}</p>
+                        <p><b>Market value:</b> {market_value}</p>
+                        <p><b>Entry / current:</b> {avg_entry} → {current_price}</p>
+                        <p><b>Unrealized P/L:</b> {unrealized_pl} / {unrealized_plpc}</p>
+                    </div>
+
+                    <div class="ai-review-box">
+                        <h4>Rule-based decision</h4>
+                        <p><b>Action:</b> {rule_action}</p>
+                        <p>{rule_reason}</p>
+                    </div>
+
+                    <div class="ai-review-box">
+                        <h4>AI decision</h4>
+                        <p><b>Rule agreement:</b> {rule_agreement}</p>
+                        <p><b>Estimated qty to sell:</b> {estimated_qty_to_sell:.4f}</p>
+                        <p><b>Profit protection:</b> {profit_notes or "No special profit protection notes."}</p>
+                    </div>
+                </div>
+
+                <details class="ai-details" open>
+                    <summary>Full AI reasoning and risks</summary>
+
+                    <div class="ai-review-grid">
+                        <div class="ai-review-box">
+                            <h4>AI reasoning</h4>
+                            <p>{reasoning or "No AI reasoning found."}</p>
+                        </div>
+
+                        <div class="ai-review-box">
+                            <h4>Risk flags</h4>
+                            <ul>{risk_html}</ul>
+                        </div>
+
+                        <div class="ai-review-box">
+                            <h4>What would change the AI's mind</h4>
+                            <p>{change_mind or "No condition listed."}</p>
+                        </div>
+                    </div>
+                </details>
+            </div>
         """
+
+    if not cards:
+        cards = "<p class='empty'>No AI position reviews yet. Run the AI sell review first.</p>"
 
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Olympus AI Position Review</title>
+        {refresh_tag}
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p>
@@ -3205,6 +3933,7 @@ def ai_positions_page(request: Request):
             <h1>AI Position Review</h1>
             <p class="subtitle">
                 Uses the Sell Analyst agent to review existing open positions after the rule-based monitor runs.
+                This page now uses readable cards instead of a cramped table.
             </p>
         </div>
 
@@ -3213,17 +3942,14 @@ def ai_positions_page(request: Request):
                 <div class="metric-title">Positions Reviewed</div>
                 <div class="big-number">{summary.get("total_positions", 0)}</div>
             </div>
-
             <div class="card">
                 <div class="metric-title">Take Profit / Trim</div>
                 <div class="big-number">{summary.get("take_profit", 0)} / {summary.get("trim", 0)}</div>
             </div>
-
             <div class="card">
                 <div class="metric-title">Sell / Cut Loss</div>
                 <div class="big-number">{summary.get("sell", 0)} / {summary.get("cut_loss", 0)}</div>
             </div>
-
             <div class="card">
                 <div class="metric-title">Hold / Watch</div>
                 <div class="big-number">{summary.get("hold", 0)} / {summary.get("watch_closely", 0)}</div>
@@ -3235,13 +3961,13 @@ def ai_positions_page(request: Request):
             <p class="muted small">Last generated: {escape(str(generated_at))}</p>
             <p class="muted small">LLM mode: {escape(str(llm_mode))}</p>
 
-            <form method="post" action="/positions/ai-review">
+            {render_task_status("AI Position Review", status)}
+
+            <form method="post" action="/positions/ai-review" class="loading-form">
                 <button type="submit">Run AI Review on Open Positions</button>
             </form>
 
-            {manual_note}
-
-            <div class="danger-callout" style="margin-top:16px;">
+            <div class="danger-callout" style="margin-top:14px;">
                 Paper sell buttons still require ALPACA_PAPER=true and SELL_TRADING_ENABLED=true.
                 Keep SELL_TRADING_ENABLED=false until you are ready to test paper sells.
             </div>
@@ -3249,33 +3975,25 @@ def ai_positions_page(request: Request):
 
         <section class="card">
             <h2>AI Sell Decisions</h2>
-            <table>
-                <tr>
-                    <th>Ticker</th>
-                    <th>AI Decision</th>
-                    <th>Rule Decision</th>
-                    <th>Confidence</th>
-                    <th>Qty</th>
-                    <th>Market Value</th>
-                    <th>Entry / Current</th>
-                    <th>Unrealized P/L</th>
-                    <th>Status / Risks</th>
-                    <th>AI Reasoning</th>
-                    <th>Action</th>
-                </tr>
-                {rows}
-            </table>
+            {cards}
         </section>
     </body>
     </html>
     """
 
-    return HTMLResponse(content=html)
-
+    return HTMLResponse(html)
 
 @app.post("/positions/ai-review")
 def run_ai_positions_review():
-    run_ai_position_review(force_refresh_positions=True)
+    if ai_position_review_lock.locked():
+        return RedirectResponse(url="/positions/ai", status_code=303)
+
+    thread = threading.Thread(
+        target=run_ai_position_review_background,
+        daemon=True,
+    )
+    thread.start()
+
     return RedirectResponse(url="/positions/ai", status_code=303)
 
 
@@ -3360,6 +4078,7 @@ def trade_theses_page(request: Request):
     <head>
         <title>Olympus Trade Theses</title>
         {shared_css()}
+        {premium_ui_css()}
     </head>
     <body>
         <p><a href="/">← Back to Dashboard</a> | <a href="/positions/ai">AI Position Review</a></p>
@@ -3384,7 +4103,7 @@ def trade_theses_page(request: Request):
                     <th>Status</th>
                     <th>Scores</th>
                     <th>Research / Quant Thesis</th>
-                    <th>PM Reasoning</th>
+                    <th><span class="term" title="Portfolio Manager agent explanation for approve, veto, or block decision.">PM Reasoning</span></th>
                     <th>Risk Notes</th>
                 </tr>
                 {rows}
@@ -3395,3 +4114,1167 @@ def trade_theses_page(request: Request):
     """
 
     return HTMLResponse(content=html)
+
+@app.get("/screening-info", response_class=HTMLResponse)
+def screening_info_page():
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Olympus Stock Screening Process</title>
+        {shared_css()}
+        {premium_ui_css()}
+    </head>
+    <body>
+        <div class="page-header">
+            <h1>Stock Screening Process Info</h1>
+            <p class="subtitle">
+                This page explains how Olympus Capital picks potential stocks in simple language.
+                The goal is not to blindly buy a stock. The system narrows the market down,
+                checks quality, reviews technical signals, looks at news, then lets the AI agents
+                and risk engine decide whether the idea is strong enough.
+            </p>
+            <a class="btn btn-dark" href="/">Back to Dashboard</a>
+        </div>
+
+        <section class="card">
+            <h2>Simple Version</h2>
+            <div class="grid grid-4">
+                <div class="card-soft">
+                    <div class="tool-number">1</div>
+                    <h3>Find Active Stocks</h3>
+                    <p class="muted">
+                        The screener looks for stocks with enough price movement and volume to be worth reviewing.
+                    </p>
+                </div>
+                <div class="card-soft">
+                    <div class="tool-number">2</div>
+                    <h3>Remove Weak Names</h3>
+                    <p class="muted">
+                        Low-quality, illiquid, or risky candidates are filtered out before wasting AI review time.
+                    </p>
+                </div>
+                <div class="card-soft">
+                    <div class="tool-number">3</div>
+                    <h3>Score Technicals</h3>
+                    <p class="muted">
+                        Olympus checks momentum, trend, volume, and price behavior using indicators like RSI and MACD.
+                    </p>
+                </div>
+                <div class="card-soft">
+                    <div class="tool-number">4</div>
+                    <h3>AI + Risk Review</h3>
+                    <p class="muted">
+                        Research, quant, portfolio, and risk agents decide whether the idea is good enough to recommend or trade.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Quant Criteria: What Makes a Stock Look Good?</h2>
+            <table>
+                <tr>
+                    <th>Signal</th>
+                    <th>What It Means</th>
+                    <th>Good Sign</th>
+                    <th>Bad / Caution Sign</th>
+                </tr>
+                <tr>
+                    <td><b>Price Momentum</b></td>
+                    <td>Whether the stock is moving strongly instead of sitting flat.</td>
+                    <td>Price is trending upward with strength.</td>
+                    <td>Price is choppy, flat, or breaking down.</td>
+                </tr>
+                <tr>
+                    <td><b>Volume</b></td>
+                    <td>How much trading activity the stock has.</td>
+                    <td>Higher-than-normal volume confirms real interest.</td>
+                    <td>Low volume can mean the move is weak or hard to trade.</td>
+                </tr>
+                <tr>
+                    <td><b>RSI</b></td>
+                    <td>Momentum score from 0 to 100.</td>
+                    <td>Strong but not overheated. Often 50-70 is healthier than extreme levels.</td>
+                    <td>Above 70 may be overbought. Below 30 may mean weak or oversold.</td>
+                </tr>
+                <tr>
+                    <td><b>MACD</b></td>
+                    <td>Trend and momentum indicator based on moving averages.</td>
+                    <td>MACD above signal line can support a long setup.</td>
+                    <td>MACD below signal line can show weakening momentum.</td>
+                </tr>
+                <tr>
+                    <td><b>Bollinger Bands</b></td>
+                    <td>Shows whether price is stretched compared with its recent average.</td>
+                    <td>Price near support with improving momentum can be interesting.</td>
+                    <td>Price stretched too far upward may be risky to chase.</td>
+                </tr>
+                <tr>
+                    <td><b>Liquidity</b></td>
+                    <td>Whether the stock trades enough shares/dollars per day.</td>
+                    <td>Easy to enter and exit without weird fills.</td>
+                    <td>Thinly traded stocks are riskier and can move unpredictably.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section class="card">
+            <h2>Quality Filters</h2>
+            <p class="muted">
+                Before a ticker reaches deep AI review, Olympus should prefer stocks that are tradable,
+                liquid, and not obviously low-quality.
+            </p>
+
+            <div class="grid grid-3">
+                <div class="card-soft">
+                    <h3>Minimum Price</h3>
+                    <p>
+                        Very low-priced stocks are avoided because they can be more volatile,
+                        easier to manipulate, and less reliable for a small systematic strategy.
+                    </p>
+                </div>
+                <div class="card-soft">
+                    <h3>Minimum Volume</h3>
+                    <p>
+                        The stock should trade enough shares so entries and exits are realistic.
+                        This helps avoid names that barely trade.
+                    </p>
+                </div>
+                <div class="card-soft">
+                    <h3>Minimum Dollar Volume</h3>
+                    <p>
+                        Dollar volume checks whether meaningful money is actually trading in the stock,
+                        not just a lot of cheap shares.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>How the AI Agents Use the Screened Stocks</h2>
+            <table>
+                <tr>
+                    <th>Stage</th>
+                    <th>Role</th>
+                    <th>Plain-English Meaning</th>
+                </tr>
+                <tr>
+                    <td><b>Research Analyst</b></td>
+                    <td>Reviews company news, sector context, and market sentiment.</td>
+                    <td>Is there a real reason this stock could move?</td>
+                </tr>
+                <tr>
+                    <td><b>Quant Analyst</b></td>
+                    <td>Reviews chart-based signals like RSI, MACD, volume, and trend.</td>
+                    <td>Does the price action support the trade idea?</td>
+                </tr>
+                <tr>
+                    <td><b>Portfolio Manager</b></td>
+                    <td>Combines research and technical evidence into a final trade opinion.</td>
+                    <td>Are the story and the chart strong enough together?</td>
+                </tr>
+                <tr>
+                    <td><b>Risk Engine</b></td>
+                    <td>Checks position sizing, exposure, sector concentration, and safety rules.</td>
+                    <td>Even if the idea looks good, is it safe to place?</td>
+                </tr>
+            </table>
+        </section>
+
+        <section class="card">
+            <h2>Current Ideal Candidate</h2>
+            <div class="success-callout">
+                A strong candidate is liquid, actively moving, supported by volume,
+                has technical momentum, has understandable news or sector support,
+                and passes risk checks without overconcentrating the portfolio.
+            </div>
+
+            <div class="warning-callout" style="margin-top: 14px;">
+                A stock should not be picked just because it has one good indicator.
+                Olympus should prefer agreement between price action, volume, news, sector context,
+                and risk controls.
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Term Definitions</h2>
+            {render_stock_glossary()}
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
+
+@app.get("/agent-decisions", response_class=HTMLResponse)
+def all_agent_decisions_page():
+    logs = get_recent_trade_logs(limit=500)
+
+    rows = ""
+    for log in logs:
+        research = log.get("research_brief", {}) or {}
+        quant = log.get("quant_signal", {}) or {}
+        pm = log.get("pm_decision", {}) or {}
+        risk = log.get("risk_result", {}) or {}
+
+        status = str(log.get("final_status", ""))
+        css = status_class(status)
+
+        rows += f"""
+            <tr>
+                <td>{escape(str(log.get("timestamp", "")))}</td>
+                <td><b>{escape(str(log.get("ticker", "")))}</b></td>
+                <td>{badge(status, css)}</td>
+                <td>{escape(str(research.get("sentiment", "")))} / {escape(str(research.get("confidence", "")))}</td>
+                <td>{escape(str(quant.get("direction", "")))} / {escape(str(quant.get("strength", "")))}</td>
+                <td>{escape(str(pm.get("decision", "")))} / {escape(str(pm.get("direction", "")))}</td>
+                <td>{escape(str(risk.get("approved", "")))}</td>
+                <td>{escape(str(pm.get("reasoning", "")))}</td>
+            </tr>
+        """
+
+    if not rows:
+        rows = """
+            <tr>
+                <td colspan="8" class="empty">No agent decisions found yet.</td>
+            </tr>
+        """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>All Agent Decisions</title>
+        {shared_css()}
+        {premium_ui_css()}
+    </head>
+    <body>
+        <p><a href="/">← Back to Dashboard</a></p>
+
+        <div class="page-header">
+            <h1>All Agent Decisions</h1>
+            <p class="subtitle">
+                Chronological history of agent decisions, ordered from most recent to oldest.
+            </p>
+        </div>
+
+        <section class="card">
+            <table>
+                <tr>
+                    <th>Time</th>
+                    <th>Ticker</th>
+                    <th>Status</th>
+                    <th>Research</th>
+                    <th>Quant</th>
+                    <th>PM</th>
+                    <th>Risk Approved</th>
+                    <th>Reasoning</th>
+                </tr>
+                {rows}
+            </table>
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
+
+
+
+
+
+def build_pie_chart(items, title):
+    """
+    Safe fallback allocation card.
+    Shows allocation as a simple table if the pie helper was lost during patches.
+    """
+    clean = []
+    total = 0.0
+
+    for label, value in items or []:
+        value = safe_float(value)
+        if value > 0:
+            clean.append((str(label), value))
+            total += value
+
+    if not clean or total <= 0:
+        return f"""
+            <div class="card">
+                <h2>{escape(str(title))}</h2>
+                <p class="empty">No allocation data available.</p>
+            </div>
+        """
+
+    rows = ""
+    for label, value in clean[:12]:
+        pct_value = (value / total) * 100 if total else 0
+        rows += f"""
+            <tr>
+                <td><b>{escape(str(label))}</b></td>
+                <td>{money(value)}</td>
+                <td>{pct_value:.1f}%</td>
+            </tr>
+        """
+
+    return f"""
+        <div class="card">
+            <h2>{escape(str(title))}</h2>
+            <table>
+                <tr>
+                    <th>Name</th>
+                    <th>Value</th>
+                    <th>Allocation</th>
+                </tr>
+                {rows}
+            </table>
+        </div>
+    """
+
+def build_portfolio_pies(positions):
+    """
+    Safe fallback portfolio allocation renderer.
+    Builds company and sector allocation cards from current open positions.
+    """
+    if not positions:
+        empty = """
+            <div class="card">
+                <h2>Allocation</h2>
+                <p class="empty">No open positions yet.</p>
+            </div>
+        """
+        return empty, empty
+
+    cache = get_company_profile_cache() if "get_company_profile_cache" in globals() else {}
+
+    by_company = []
+    by_sector = {}
+
+    for position in positions:
+        ticker = get_position_symbol(position)
+        market_value = safe_float(position.get("market_value"))
+
+        if not ticker or market_value <= 0:
+            continue
+
+        sector = "Other / Unclassified"
+        try:
+            sector = get_position_sector(ticker, cache)
+        except Exception:
+            sector = "Other / Unclassified"
+
+        by_company.append((ticker, market_value))
+        by_sector[sector] = by_sector.get(sector, 0) + market_value
+
+    by_company = sorted(by_company, key=lambda x: x[1], reverse=True)
+    by_sector = sorted(by_sector.items(), key=lambda x: x[1], reverse=True)
+
+    company_html = build_pie_chart(by_company, "Company Allocation")
+    sector_html = build_pie_chart(by_sector, "Sector Allocation")
+
+    return company_html, sector_html
+
+
+
+def build_position_intelligence_table(positions):
+    """
+    Safe fallback position table.
+    Shows current holdings and simple P/L status if the richer AI position helper was lost.
+    """
+    if not positions:
+        return "<p class='empty'>No open positions yet.</p>"
+
+    rows = ""
+
+    for position in sorted(positions, key=lambda p: safe_float(p.get("market_value")), reverse=True):
+        ticker = get_position_symbol(position)
+        market_value = safe_float(position.get("market_value"))
+        unrealized_pl = safe_float(position.get("unrealized_pl"))
+        pl_pct = position_pl_pct(position)
+
+        pl_class = "approved" if unrealized_pl >= 0 else "blocked"
+
+        if pl_pct <= -8:
+            action = badge("review / cut loss", "blocked")
+            reasoning = "Position is down heavily. Review whether the thesis is still valid."
+        elif pl_pct >= 15:
+            action = badge("consider taking profit", "recommended")
+            reasoning = "Position is up strongly. Consider protecting gains."
+        elif pl_pct >= 0:
+            action = badge("hold", "approved")
+            reasoning = "Position is profitable. Holding may be reasonable unless thesis weakens."
+        else:
+            action = badge("watch closely", "vetoed")
+            reasoning = "Position is down but not at automatic cut-loss level."
+
+        rows += f"""
+            <tr>
+                <td><b>{escape(str(ticker))}</b></td>
+                <td>{money(market_value)}</td>
+                <td>{badge(f"{money(unrealized_pl)} / {pl_pct:+.1f}%", pl_class)}</td>
+                <td>{action}</td>
+                <td>{escape(reasoning)}</td>
+            </tr>
+        """
+
+    return f"""
+        <table>
+            <tr>
+                <th>Ticker</th>
+                <th>Market Value</th>
+                <th>Unrealized P/L</th>
+                <th>Suggested Action</th>
+                <th>Reasoning</th>
+            </tr>
+            {rows}
+        </table>
+    """
+
+@app.get("/", response_class=HTMLResponse)
+def home(chart_range: str = "1M"):
+    try:
+        account, positions = get_cached_account_and_positions()
+        save_portfolio_snapshot(account)
+
+        portfolio_history = get_portfolio_history(limit=500)
+        filtered_portfolio_history = filter_history_by_range(portfolio_history, chart_range)
+        chart_range_buttons = build_chart_range_buttons(chart_range)
+        portfolio_chart = build_portfolio_line_chart(filtered_portfolio_history, chart_range)
+
+        company_pie, sector_pie = build_portfolio_pies(positions)
+        intelligence_table = build_position_intelligence_table(positions)
+
+        logs = get_recent_trade_logs(limit=5)
+        summary = summarize_logs(get_today_trade_logs())
+
+        log_rows = ""
+        for log in logs:
+            ticker = escape(str(log.get("ticker", "")))
+            status = escape(str(log.get("final_status", "")))
+            css = status_class(status)
+            timestamp = escape(str(log.get("timestamp", "")))
+
+            pm = log.get("pm_decision", {}) or {}
+            reasoning = escape(str(pm.get("reasoning", "")))
+
+            log_rows += f"""
+                <tr>
+                    <td>{timestamp}</td>
+                    <td><b>{ticker}</b></td>
+                    <td>{badge(status, css)}</td>
+                    <td>{reasoning}</td>
+                </tr>
+            """
+
+        if not log_rows:
+            log_rows = "<tr><td colspan='4' class='empty'>No recent decisions yet.</td></tr>"
+
+        trade_test_status = read_json(TRADE_TEST_STATUS_PATH, {
+            "status": "not_started",
+            "message": "No paper trade submission is running.",
+        })
+
+        refresh_tag = ""
+        if is_running_status(trade_test_status.get("status")):
+            refresh_tag = '<meta http-equiv="refresh" content="5">'
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Olympus Capital Dashboard</title>
+            {refresh_tag}
+            {shared_css()}
+        {premium_ui_css()}
+        </head>
+        <body>
+            <div class="page-header">
+                <h1>Olympus Capital</h1>
+                <p class="subtitle">Portfolio dashboard, paper trading controls, scans, reviews, and agent decisions.</p>
+
+                <div class="button-row">
+                    <a class="btn btn-dark" href="/fast-scan">Fast Scan</a>
+                    <a class="btn btn-dark" href="/deep-review">Deep AI Review</a>
+                    <a class="btn btn-dark" href="/positions">Positions</a>
+                    <a class="btn btn-dark" href="/agent-decisions">All Agent Decisions</a>
+                    <a class="btn btn-dark" href="/screening-info">Screening Info</a>
+                </div>
+            </div>
+
+            <section class="card">
+                <h2>Portfolio Value Over Time</h2>
+                {chart_range_buttons}
+                {portfolio_chart}
+            </section>
+
+            <div class="grid grid-2">
+                {company_pie}
+                {sector_pie}
+            </div>
+
+            <section class="card" id="run-ticker">
+                <h2>Submit Paper Trade on Ticker</h2>
+                <div class="warning-callout">
+                    User-directed paper trade submitter. This bypasses AI veto/risk approval, but still uses broker safety checks.
+                </div>
+
+                {render_task_status("Submit Paper Trade on Ticker", trade_test_status)}
+
+                <form method="post" action="/run-ticker" class="loading-form" style="margin-top:16px;">
+                    <input type="text" name="ticker" placeholder="Enter ticker, e.g. TSLA" required>
+                    <input type="number" name="notional_value" value="100" min="1" step="1" placeholder="Paper trade dollars">
+                    <button type="submit">Submit Paper Trade</button>
+                </form>
+            </section>
+
+            <h2 class="section-title">Today's Decision Summary</h2>
+            <div class="grid grid-4">
+                <div class="card"><div class="metric-title">Recommended</div><div class="big-number">{summary.get("recommended", 0)}</div></div>
+                <div class="card"><div class="metric-title">Submitted</div><div class="big-number">{summary.get("submitted", 0)}</div></div>
+                <div class="card"><div class="metric-title">Vetoed</div><div class="big-number">{summary.get("vetoed", 0)}</div></div>
+                <div class="card"><div class="metric-title">Blocked / Errors</div><div class="big-number">{summary.get("blocked", 0) + summary.get("errors", 0)}</div></div>
+            </div>
+
+            <section class="card">
+                <h2>Position Intelligence</h2>
+                {intelligence_table}
+            </section>
+
+            <section class="card">
+                <h2>Recent Agent Decisions</h2>
+                <div class="button-row">
+                    <a class="btn btn-dark" href="/agent-decisions">View All Agent Decisions</a>
+                </div>
+                <table>
+                    <tr>
+                        <th>Time</th>
+                        <th>Ticker</th>
+                        <th>Status</th>
+                        <th>Reasoning</th>
+                    </tr>
+                    {log_rows}
+                </table>
+            </section>
+        </body>
+        </html>
+        """
+
+        return HTMLResponse(html)
+
+    except Exception as e:
+        return HTMLResponse(
+            f"""
+            <h1>Dashboard failed to load</h1>
+            <pre>{escape(str(e))}</pre>
+            <p><a href="/fast-scan">Fast Scan</a></p>
+            <p><a href="/deep-review">Deep AI Review</a></p>
+            <p><a href="/positions">Positions</a></p>
+            """,
+            status_code=500,
+        )
+
+
+# ============================================================
+
+
+def fallback_position_action(position):
+    """
+    Safe fallback when no AI position review exists yet.
+    Uses simple unrealized P/L rules.
+    """
+    pl_pct = position_pl_pct(position)
+
+    if pl_pct <= -8:
+        return (
+            "SELL / CUT LOSS",
+            "blocked",
+            f"Down {pl_pct:.1f}%. Review the thesis and consider cutting if news or momentum is weak.",
+        )
+
+    if pl_pct >= 15:
+        return (
+            "TRIM / TAKE PROFIT",
+            "recommended",
+            f"Up {pl_pct:.1f}%. Consider trimming unless the thesis is still clearly improving.",
+        )
+
+    if pl_pct >= 0:
+        return (
+            "HOLD",
+            "approved",
+            f"Up {pl_pct:.1f}%. Holding is reasonable unless news or technicals weaken.",
+        )
+
+    return (
+        "WATCH CLOSELY",
+        "vetoed",
+        f"Down {pl_pct:.1f}%. Not an automatic sell, but monitor it closely.",
+    )
+
+# RESTORED DASHBOARD UI HELPERS
+# Added as late overrides so they replace emergency fallbacks.
+# ============================================================
+
+def build_pie_chart(items, title):
+    clean = []
+    total = 0.0
+
+    for label, value in items or []:
+        value = safe_float(value)
+        if value > 0:
+            clean.append((str(label), value))
+            total += value
+
+    if not clean or total <= 0:
+        return f"""
+            <div class="allocation-card">
+                <h3>{escape(str(title))}</h3>
+                <p class="empty">No allocation data available.</p>
+            </div>
+        """
+
+    colors = [
+        "#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa",
+        "#22d3ee", "#fb7185", "#c084fc", "#4ade80", "#f97316"
+    ]
+
+    current = 0.0
+    stops = []
+    legend_rows = ""
+
+    for idx, pair in enumerate(clean[:10]):
+        label, value = pair
+        pct_value = (value / total) * 100
+        start = current
+        end = current + pct_value
+        color = colors[idx % len(colors)]
+        stops.append(f"{color} {start:.2f}% {end:.2f}%")
+        current = end
+
+        legend_rows += f"""
+            <div class="legend-row">
+                <span class="legend-left">
+                    <span class="legend-dot" style="background:{color};"></span>
+                    {escape(label)}
+                </span>
+                <span>{pct_value:.1f}%</span>
+            </div>
+        """
+
+    gradient = ", ".join(stops)
+
+    return f"""
+        <div class="allocation-card">
+            <h3>{escape(str(title))}</h3>
+            <div class="pie-wrap">
+                <div class="pie" style="background: conic-gradient({gradient});"></div>
+                <div class="pie-center">
+                    <strong>{len(clean)}</strong>
+                    <span>items</span>
+                </div>
+            </div>
+            <div class="legend">
+                {legend_rows}
+            </div>
+        </div>
+    """
+
+
+def build_portfolio_pies(positions):
+    if not positions:
+        empty = """
+            <div class="allocation-card">
+                <h3>Allocation</h3>
+                <p class="empty">No open positions yet.</p>
+            </div>
+        """
+        return empty, empty
+
+    try:
+        cache = get_company_profile_cache()
+    except Exception:
+        cache = {}
+
+    by_company = []
+    by_sector = {}
+
+    for position in positions:
+        ticker = get_position_symbol(position)
+        market_value = safe_float(position.get("market_value"))
+
+        if not ticker or market_value <= 0:
+            continue
+
+        try:
+            sector = get_position_sector(ticker, cache)
+        except Exception:
+            sector = "Other / Unclassified"
+
+        if not sector or str(sector).lower() == "unknown":
+            sector = "Other / Unclassified"
+
+        by_company.append((ticker, market_value))
+        by_sector[sector] = by_sector.get(sector, 0) + market_value
+
+    by_company = sorted(by_company, key=lambda x: x[1], reverse=True)
+    by_sector = sorted(by_sector.items(), key=lambda x: x[1], reverse=True)
+
+    return (
+        build_pie_chart(by_company, "Company Allocation"),
+        build_pie_chart(by_sector, "Sector Allocation"),
+    )
+
+
+def build_position_intelligence_table(positions):
+    if not positions:
+        return "<p class='empty'>No open positions yet.</p>"
+
+    try:
+        ai_map, ai_data = get_ai_decision_map()
+    except Exception:
+        ai_map, ai_data = {}, {}
+
+    rows = ""
+
+    for position in sorted(positions, key=lambda p: safe_float(p.get("market_value")), reverse=True):
+        ticker = get_position_symbol(position)
+        market_value = safe_float(position.get("market_value"))
+        unrealized_pl = safe_float(position.get("unrealized_pl"))
+        pl_pct = position_pl_pct(position)
+
+        ai_decision = ai_map.get(ticker)
+
+        if ai_decision:
+            decision = str(ai_decision.get("decision", "HOLD")).replace("_", " ")
+            reasoning = str(ai_decision.get("reasoning", "No AI reasoning found."))
+            sell_pct = safe_float(ai_decision.get("sell_pct"))
+            confidence = safe_float(ai_decision.get("confidence"))
+            thesis_status = str(ai_decision.get("thesis_status", "unknown")).replace("_", " ")
+            css = status_class(decision)
+
+            action_html = f"""
+                {badge(decision, css)}
+                <div class="muted small">Confidence: {confidence:.0f}/100 · Suggested sell: {sell_pct:.0f}%</div>
+                <div class="muted small">Thesis: {escape(thesis_status)}</div>
+            """
+
+            sell_button = ""
+            if sell_pct > 0:
+                sell_button = f"""
+                    <form method="post" action="/positions/ai-sell" style="margin-top:8px;">
+                        <input type="hidden" name="ticker" value="{escape(ticker)}">
+                        <input type="hidden" name="sell_pct" value="{sell_pct}">
+                        <button type="submit" class="btn btn-red" style="padding:8px 10px; font-size:12px;">
+                            Submit Suggested Sell {sell_pct:.0f}%
+                        </button>
+                    </form>
+                """
+            else:
+                sell_button = "<span class='muted small'>No sell action suggested.</span>"
+
+        else:
+            decision, css, reasoning = fallback_position_action(position)
+            action_html = badge(decision, css)
+            sell_button = "<span class='muted small'>Run AI review for sell/hold decision.</span>"
+
+        pl_class = "approved" if unrealized_pl >= 0 else "blocked"
+
+        rows += f"""
+            <tr>
+                <td><b>{escape(ticker)}</b></td>
+                <td>{money(market_value)}</td>
+                <td>{badge(f"{money(unrealized_pl)} / {pl_pct:+.1f}%", pl_class)}</td>
+                <td>{action_html}</td>
+                <td>{escape(reasoning)}</td>
+                <td>{sell_button}</td>
+            </tr>
+        """
+
+    generated_at = ai_data.get("generated_at")
+    if generated_at:
+        ai_note = f"<p class='muted small'>AI position review last generated: {escape(str(generated_at))}</p>"
+    else:
+        ai_note = "<p class='muted small'>No cached AI position review yet. Run AI review to get sell/hold recommendations.</p>"
+
+    return f"""
+        {ai_note}
+
+        <form method="post" action="/positions/ai-review" style="margin-bottom: 16px;">
+            <button type="submit">Refresh AI Hold / Sell Review</button>
+            <a href="/positions/ai" class="btn btn-dark">Open Full AI Position Review</a>
+        </form>
+
+        <table>
+            <tr>
+                <th>Ticker</th>
+                <th>Market Value</th>
+                <th>Unrealized P/L</th>
+                <th>AI Suggested Action</th>
+                <th>AI Reasoning</th>
+                <th>Trade Action</th>
+            </tr>
+            {rows}
+        </table>
+    """
+
+
+def build_portfolio_line_chart(history, selected_range="1M"):
+    if not history:
+        return "<p class='empty'>No portfolio snapshots yet. Reload the dashboard over time to build the graph.</p>"
+
+    points = []
+
+    for item in history:
+        points.append({
+            "timestamp": item.get("timestamp", ""),
+            "value": safe_float(item.get("portfolio_value")),
+        })
+
+    if len(points) == 1:
+        points = points * 2
+
+    values = [p["value"] for p in points]
+    min_v = min(values)
+    max_v = max(values)
+    spread = max(max_v - min_v, 1)
+
+    width = 760
+    height = 260
+    pad_x = 38
+    pad_y = 28
+
+    coords = []
+
+    for i, point in enumerate(points):
+        x = pad_x + (i / max(len(points) - 1, 1)) * (width - pad_x * 2)
+        y = height - pad_y - ((point["value"] - min_v) / spread) * (height - pad_y * 2)
+        coords.append((x, y, point))
+
+    polyline = " ".join([f"{x:.1f},{y:.1f}" for x, y, point in coords])
+    area_points = f"{pad_x},{height-pad_y} " + polyline + f" {width-pad_x},{height-pad_y}"
+
+    hover_zones = ""
+    point_markers = ""
+
+    for i, (x, y, point) in enumerate(coords):
+        ts = str(point["timestamp"])
+        value = point["value"]
+
+        try:
+            display_time = format_chart_timestamp(ts)
+        except Exception:
+            display_time = ts
+
+        tooltip = escape(f"{display_time} | {money(value)}")
+
+        if i == 0:
+            left_x = pad_x
+        else:
+            left_x = (coords[i - 1][0] + x) / 2
+
+        if i == len(coords) - 1:
+            right_x = width - pad_x
+        else:
+            right_x = (x + coords[i + 1][0]) / 2
+
+        zone_width = max(right_x - left_x, 12)
+
+        # Wide invisible vertical hover zone. This makes hover MUCH easier than tracing the exact line.
+        hover_zones += f"""
+            <rect
+                class="chart-hover-zone"
+                x="{left_x:.1f}"
+                y="0"
+                width="{zone_width:.1f}"
+                height="{height}"
+                fill="transparent"
+                data-tooltip="{tooltip}"
+            ></rect>
+        """
+
+        point_markers += f"""
+            <circle
+                class="portfolio-point"
+                cx="{x:.1f}"
+                cy="{y:.1f}"
+                r="4"
+                fill="#93c5fd"
+                data-tooltip="{tooltip}"
+            ></circle>
+        """
+
+    start_value = points[0]["value"]
+    end_value = points[-1]["value"]
+    change = end_value - start_value
+    change_pct = (change / start_value * 100) if start_value else 0
+    change_class = "approved" if change >= 0 else "blocked"
+
+    selected_range = escape(str(selected_range or "1M").upper())
+
+    return f"""
+        <div class="chart-card portfolio-chart-shell" style="position:relative;">
+            <div class="chart-header" style="display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+                <div>
+                    <div class="metric-title">Portfolio Value Over Time · {selected_range}</div>
+                    <div class="big-number">{money(end_value)}</div>
+                    <div class="muted small">From {money(start_value)} to {money(end_value)}</div>
+                </div>
+                <div>{badge(f"{change:+,.2f} / {change_pct:+.1f}%", change_class)}</div>
+            </div>
+
+            <div id="portfolioChartTooltip"
+                 style="display:none; position:absolute; z-index:50; pointer-events:none;
+                        background:rgba(2,6,23,0.96); border:1px solid rgba(147,197,253,0.45);
+                        color:#f8fafc; padding:8px 10px; border-radius:10px;
+                        font-size:13px; box-shadow:0 12px 30px rgba(0,0,0,0.35);">
+            </div>
+
+            <svg class="line-svg" viewBox="0 0 {width} {height}" preserveAspectRatio="none" style="width:100%; height:260px;">
+                <defs>
+                    <linearGradient id="portfolioFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.35"/>
+                        <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.02"/>
+                    </linearGradient>
+                </defs>
+
+                <line x1="{pad_x}" y1="{height-pad_y}" x2="{width-pad_x}" y2="{height-pad_y}" stroke="rgba(148,163,184,0.35)" />
+                <line x1="{pad_x}" y1="{pad_y}" x2="{pad_x}" y2="{height-pad_y}" stroke="rgba(148,163,184,0.20)" />
+
+                <polygon points="{area_points}" fill="url(#portfolioFill)" />
+                <polyline points="{polyline}" fill="none" stroke="#60a5fa" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+
+                {point_markers}
+                {hover_zones}
+            </svg>
+
+            <p class="muted small">
+                Hover anywhere vertically above a point to see timestamp and portfolio value.
+            </p>
+
+            <script>
+                (function() {{
+                    const shell = document.currentScript.closest(".portfolio-chart-shell");
+                    if (!shell) return;
+
+                    const tip = shell.querySelector("#portfolioChartTooltip");
+                    const targets = shell.querySelectorAll(".chart-hover-zone, .portfolio-point");
+
+                    targets.forEach(function(el) {{
+                        el.addEventListener("mousemove", function(e) {{
+                            const text = el.getAttribute("data-tooltip");
+                            if (!text) return;
+
+                            const rect = shell.getBoundingClientRect();
+                            tip.textContent = text;
+                            tip.style.display = "block";
+                            tip.style.left = Math.min(e.clientX - rect.left + 14, rect.width - 260) + "px";
+                            tip.style.top = Math.max(e.clientY - rect.top - 36, 8) + "px";
+                        }});
+
+                        el.addEventListener("mouseleave", function() {{
+                            tip.style.display = "none";
+                        }});
+                    }});
+                }})();
+            </script>
+        </div>
+    """
+
+
+@app.post("/positions/ai-sell")
+def submit_ai_position_sell(ticker: str = Form(...), sell_pct: float = Form(...)):
+    ticker = ticker.strip().upper()
+
+    try:
+        execute_ai_sell(ticker=ticker, sell_pct=sell_pct)
+    except Exception as e:
+        return HTMLResponse(
+            f"""
+            <h2>AI sell failed for {escape(ticker)}</h2>
+            <pre>{escape(str(e))}</pre>
+            <p><a href="/">Back to dashboard</a></p>
+            <p><a href="/positions/ai">Open full AI position review</a></p>
+            """,
+            status_code=500,
+        )
+
+    return RedirectResponse(url="/", status_code=303)
+
+
+# ============================================================
+# FORCE RESTORE PIE CHARTS
+# Self-contained allocation cards with inline styles.
+# ============================================================
+
+def build_pie_chart(items, title):
+    clean = []
+    total = 0.0
+
+    for label, value in items or []:
+        value = safe_float(value)
+        if value > 0:
+            clean.append((str(label), value))
+            total += value
+
+    if not clean or total <= 0:
+        return f"""
+            <div style="
+                background: rgba(17,24,39,0.86);
+                border: 1px solid rgba(148,163,184,0.18);
+                border-radius: 20px;
+                padding: 24px;
+                margin-bottom: 22px;
+                color: #f8fafc;
+            ">
+                <h2>{escape(str(title))}</h2>
+                <p class="empty">No allocation data available.</p>
+            </div>
+        """
+
+    colors = [
+        "#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa",
+        "#22d3ee", "#fb7185", "#c084fc", "#4ade80", "#f97316"
+    ]
+
+    current = 0.0
+    stops = ""
+    legend_rows = ""
+
+    for idx, pair in enumerate(clean[:10]):
+        label, value = pair
+        pct_value = (value / total) * 100
+        start = current
+        end = current + pct_value
+        color = colors[idx % len(colors)]
+        current = end
+
+        if stops:
+            stops += ", "
+        stops += f"{color} {start:.2f}% {end:.2f}%"
+
+        legend_rows += f"""
+            <div style="
+                display:flex;
+                justify-content:space-between;
+                gap:16px;
+                align-items:center;
+                padding:8px 0;
+                color:#f8fafc;
+                font-size:15px;
+            ">
+                <span style="display:flex; align-items:center; gap:10px;">
+                    <span style="
+                        width:12px;
+                        height:12px;
+                        border-radius:999px;
+                        background:{color};
+                        display:inline-block;
+                    "></span>
+                    <b>{escape(str(label))}</b>
+                </span>
+                <span>{pct_value:.1f}%</span>
+            </div>
+        """
+
+    return f"""
+        <div style="
+            background: rgba(17,24,39,0.86);
+            border: 1px solid rgba(148,163,184,0.18);
+            border-radius: 20px;
+            padding: 24px;
+            margin-bottom: 22px;
+            color: #f8fafc;
+            box-shadow: 0 24px 70px rgba(0,0,0,0.35);
+        ">
+            <h2 style="margin-top:0;">{escape(str(title))}</h2>
+
+            <div style="
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                margin:18px 0 24px 0;
+            ">
+                <div style="
+                    width:260px;
+                    height:260px;
+                    border-radius:50%;
+                    background: conic-gradient({stops});
+                    position:relative;
+                    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+                ">
+                    <div style="
+                        position:absolute;
+                        inset:70px;
+                        background:#020617;
+                        border-radius:50%;
+                        display:flex;
+                        flex-direction:column;
+                        align-items:center;
+                        justify-content:center;
+                        color:#f8fafc;
+                    ">
+                        <strong style="font-size:38px; line-height:1;">{len(clean)}</strong>
+                        <span style="color:#94a3b8; font-size:14px;">items</span>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                {legend_rows}
+            </div>
+        </div>
+    """
+
+
+def build_portfolio_pies(positions):
+    if not positions:
+        empty = """
+            <div style="
+                background: rgba(17,24,39,0.86);
+                border: 1px solid rgba(148,163,184,0.18);
+                border-radius: 20px;
+                padding: 24px;
+                margin-bottom: 22px;
+                color: #f8fafc;
+            ">
+                <h2>Allocation</h2>
+                <p class="empty">No open positions yet.</p>
+            </div>
+        """
+        return empty, empty
+
+    try:
+        cache = get_company_profile_cache()
+    except Exception:
+        cache = {}
+
+    by_company = []
+    by_sector = {}
+
+    for position in positions:
+        ticker = get_position_symbol(position)
+        market_value = safe_float(position.get("market_value"))
+
+        if not ticker or market_value <= 0:
+            continue
+
+        try:
+            sector = get_position_sector(ticker, cache)
+        except Exception:
+            sector = "Other / Unclassified"
+
+        if not sector or str(sector).strip().lower() == "unknown":
+            sector = "Other / Unclassified"
+
+        by_company.append((ticker, market_value))
+        by_sector[sector] = by_sector.get(sector, 0) + market_value
+
+    by_company = sorted(by_company, key=lambda x: x[1], reverse=True)
+    by_sector = sorted(by_sector.items(), key=lambda x: x[1], reverse=True)
+
+    return (
+        build_pie_chart(by_company, "Company Allocation"),
+        build_pie_chart(by_sector, "Sector Allocation"),
+    )
+
+

@@ -242,10 +242,17 @@ def select_candidates_for_deep_review(
     include_previous_errors=False,
 ):
     """
-    Selects best Fast Scan candidates for Deep Review.
+    Selects top Fast Scan candidates for Deep Review.
 
-    If no Fast Scan exists, this function raises a clear error instead of
-    silently falling back to random hardcoded tickers.
+    Simple rule:
+    - Read fast_scan_results.json
+    - Keep quality-approved candidates
+    - Skip names already completed in Deep Review
+    - Sort by the visible Fast Scan score
+    - Return the top max_candidates
+
+    This keeps the dashboard easy to understand:
+    Fast Scan ranking = Deep Review input ranking.
     """
     fast_scan_data, candidates = extract_fast_scan_candidates()
 
@@ -292,11 +299,27 @@ def select_candidates_for_deep_review(
             continue
 
         enriched = dict(candidate)
-        enriched["_deep_review_selection_score"] = candidate_quality_score(candidate)
+
+        fast_scan_score = (
+            candidate.get("score")
+            or candidate.get("fast_scan_score")
+            or candidate.get("candidate_score")
+            or candidate.get("quality_score")
+            or candidate.get("technical_score")
+            or candidate.get("ranking_score")
+            or candidate.get("total_score")
+            or candidate.get("scan_score")
+            or 0
+        )
+
+        enriched["fast_scan_score"] = safe_float(fast_scan_score)
+        enriched["_deep_review_selection_score"] = safe_float(fast_scan_score)
+        enriched["_selection_method"] = "visible_fast_scan_score"
+
         ranked.append(enriched)
 
     ranked.sort(
-        key=lambda item: safe_float(item.get("_deep_review_selection_score")),
+        key=lambda item: safe_float(item.get("fast_scan_score")),
         reverse=True,
     )
 
@@ -308,6 +331,7 @@ def select_candidates_for_deep_review(
         "eligible_candidates": len(ranked),
         "selected": selected,
         "selected_tickers": [item.get("ticker") for item in selected],
+        "selection_method": "top_visible_fast_scan_score",
     }
 
 
