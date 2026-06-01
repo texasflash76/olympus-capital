@@ -1,6 +1,7 @@
 from trade_thesis_store import get_all_trade_theses
 import os
 import json
+import requests
 import sqlite3
 import threading
 from pathlib import Path
@@ -196,6 +197,9 @@ def task_percent(status):
 
 
 def render_task_status(title, status):
+    status_value = str(status.get("status", "not_started"))
+    running_dot = "<span class='loading-pulse-dot'></span>" if status_value == "running" else ""
+    indeterminate_class = ""
     status = status or {}
     state = str(status.get("status", "not_started"))
     message = str(status.get("message", "No task has started yet."))
@@ -231,7 +235,7 @@ def render_task_status(title, status):
                 <div>{badge(state, status_class(state))}</div>
             </div>
 
-            <div class="progress-shell">
+            <div class="progress-shell {indeterminate_class}">
                 <div class="progress-bar" style="width: {percent:.1f}%;"></div>
             </div>
 
@@ -402,6 +406,147 @@ def run_ai_position_review_background():
 
 
 
+
+
+
+
+
+def expandable_details(summary, html):
+    return f"""
+        <details class="ai-details">
+            <summary>{escape(str(summary))}</summary>
+            <div class="ai-review-box wide-readable">
+                {html}
+            </div>
+        </details>
+    """
+
+
+
+
+
+def back_to_dashboard_button():
+    return """
+        <div class="back-button-wrap">
+            
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
+        </div>
+    """
+
+
+
+
+def market_hours_queue_warning(action="trade"):
+    action = str(action or "trade").lower()
+
+    if action == "sell":
+        title = "Market-hours note for sells"
+        body = "If you submit a sell after regular market hours, Alpaca may queue it for the next trading day unless the order is extended-hours eligible. If the position is already held for an open sell order, do not click sell again."
+    elif action == "buy":
+        title = "Market-hours note for buys"
+        body = "If you submit a buy after regular market hours, Alpaca may queue it for the next trading day unless the order is extended-hours eligible. The fill price may differ from the current displayed price."
+    else:
+        title = "Market-hours note"
+        body = "Orders submitted after regular market hours may be queued for the next trading day unless they are extended-hours eligible."
+
+    return f"""
+        <div class="warning-callout" style="margin-top:14px;">
+            <b>{title}</b><br>
+            {body}
+        </div>
+    """
+
+def render_dashboard_navigation():
+    return """
+        <section class="card">
+            <h2>Command Center</h2>
+            <p class="muted">
+                Use Olympus in order: run a Quant Scan, review the strongest candidates with Deep AI Review,
+                then submit paper trades only for tickers you want to test.
+            </p>
+
+            <div class="grid grid-4">
+                <a href="/fast-scan" style="text-decoration:none;">
+                    <div class="card-soft">
+                        <div class="tool-number">1</div>
+                        <h3>Quant Scan</h3>
+                        <p class="muted small">Rank stocks by technical and quantitative strength.</p>
+                    </div>
+                </a>
+
+                <a href="/deep-review" style="text-decoration:none;">
+                    <div class="card-soft">
+                        <div class="tool-number">2</div>
+                        <h3>Deep AI Review</h3>
+                        <p class="muted small">Run research, quant, PM, and risk agents.</p>
+                    </div>
+                </a>
+
+                <a href="/positions" style="text-decoration:none;">
+                    <div class="card-soft">
+                        <div class="tool-number">3</div>
+                        <h3>Positions</h3>
+                        <p class="muted small">Review open holdings and sell logic.</p>
+                    </div>
+                </a>
+
+                <a href="/agent-decisions" style="text-decoration:none;">
+                    <div class="card-soft">
+                        <div class="tool-number">4</div>
+                        <h3>Agent Decisions</h3>
+                        <p class="muted small">See the full decision history.</p>
+                    </div>
+                </a>
+
+                <a href="/orders" style="text-decoration:none;">
+                    <div class="card-soft">
+                        <div class="tool-number">5</div>
+                        <h3>Pending Orders</h3>
+                        <p class="muted small">See queued/open buy and sell orders.</p>
+                    </div>
+                </a>
+            </div>
+        </section>
+    """
+
+def render_workflow_guide(active_step=""):
+    steps = [
+        ("1", "Quant Scan", "Find and rank candidates using numbers first.", "/fast-scan", "quant"),
+        ("2", "Deep AI Review", "Run research, quant, PM, and risk agents on selected names.", "/deep-review", "deep"),
+        ("3", "Submit Paper Trade", "Only trade tickers you agree with after review.", "/#run-ticker", "trade"),
+    ]
+
+    cards = ""
+    for num, title, desc, href, key in steps:
+        active = key == str(active_step or "").lower()
+        border = "rgba(52, 211, 153, 0.55)" if active else "rgba(148, 163, 184, 0.16)"
+        glow = "0 0 32px rgba(52, 211, 153, 0.12)" if active else "none"
+
+        cards += f"""
+            <a href="{href}" style="text-decoration:none;">
+                <div class="card-soft" style="border-color:{border} !important; box-shadow:{glow}; min-height:145px;">
+                    <div class="tool-number">{num}</div>
+                    <h3>{title}</h3>
+                    <p class="muted small">{desc}</p>
+                </div>
+            </a>
+        """
+
+    return f"""
+        <section class="card">
+            <h2>Recommended Workflow</h2>
+            <p class="muted">
+                Use Olympus in this order: first run a Quant Scan, then run Deep AI Review on the selected candidates,
+                then submit a paper trade only for tickers you personally want to test.
+            </p>
+            <div class="grid grid-3">
+                {cards}
+            </div>
+        </section>
+    """
 
 def premium_ui_css():
     return """
@@ -738,6 +883,276 @@ def premium_ui_css():
             min-width: 320px;
             line-height: 1.55;
             overflow-wrap: anywhere;
+        }
+
+    
+        .workflow-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 11px;
+            border-radius: 999px;
+            border: 1px solid rgba(96, 165, 250, 0.25);
+            background: rgba(96, 165, 250, 0.10);
+            color: #dbeafe;
+            font-weight: 800;
+            font-size: 13px;
+        }
+
+        details.ai-details {
+            min-width: 240px;
+        }
+
+        details.ai-details summary {
+            list-style: none;
+            cursor: pointer;
+            color: #93c5fd;
+            font-weight: 900;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        details.ai-details summary::before {
+            content: "▸";
+            transition: transform 0.15s ease;
+        }
+
+        details.ai-details[open] summary::before {
+            transform: rotate(90deg);
+        }
+
+        details.ai-details[open] {
+            min-width: 420px;
+        }
+
+        .wide-readable {
+            max-width: 720px;
+            line-height: 1.55;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            margin-top: 12px;
+        }
+
+        label {
+            color: #bfdbfe;
+            font-weight: 800;
+        }
+
+    
+        .position-detail-row td {
+            background: rgba(2, 6, 23, 0.38) !important;
+            padding: 0 18px 18px 18px !important;
+        }
+
+        .full-row-details {
+            width: 100%;
+        }
+
+        .full-row-details summary {
+            padding: 14px 0;
+            font-size: 15px;
+        }
+
+        .full-width-detail-box {
+            display: grid;
+            grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.2fr);
+            gap: 18px;
+            width: 100%;
+            max-width: none;
+            background: rgba(15, 23, 42, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 18px;
+            padding: 20px;
+            overflow: visible;
+            white-space: normal;
+            line-height: 1.55;
+        }
+
+        .full-width-detail-box h4 {
+            margin: 0 0 10px 0;
+            color: #bfdbfe;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .full-width-detail-box ul {
+            margin-top: 8px;
+            padding-left: 22px;
+        }
+
+        .full-width-detail-box li {
+            margin-bottom: 8px;
+            overflow-wrap: anywhere;
+            word-break: normal;
+        }
+
+        @media (max-width: 900px) {
+            .full-width-detail-box {
+                grid-template-columns: 1fr;
+            }
+        }
+
+    
+        .back-button-wrap {
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            margin: 28px 0 38px 0;
+        }
+
+        .back-dashboard-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 310px;
+            padding: 22px 42px;
+            border-radius: 999px;
+            text-decoration: none !important;
+            color: #f8fafc !important;
+            font-size: 26px;
+            font-weight: 950;
+            letter-spacing: -0.03em;
+            background:
+                linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.96));
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            box-shadow:
+                0 22px 55px rgba(0, 0, 0, 0.35),
+                inset 0 1px 0 rgba(255, 255, 255, 0.08);
+            transition:
+                transform 0.16s ease,
+                border-color 0.16s ease,
+                box-shadow 0.16s ease,
+                filter 0.16s ease;
+        }
+
+        .back-dashboard-btn:hover {
+            transform: translateY(-2px) scale(1.01);
+            border-color: rgba(147, 197, 253, 0.42);
+            box-shadow:
+                0 28px 70px rgba(0, 0, 0, 0.45),
+                0 0 34px rgba(96, 165, 250, 0.13),
+                inset 0 1px 0 rgba(255, 255, 255, 0.12);
+            filter: brightness(1.08);
+        }
+
+        .back-dashboard-btn::before {
+            content: "←";
+            margin-right: 12px;
+            color: #93c5fd;
+            font-weight: 900;
+        }
+
+        @media (max-width: 700px) {
+            .back-dashboard-btn {
+                min-width: unset;
+                width: 100%;
+                font-size: 22px;
+                padding: 18px 24px;
+            }
+        }
+
+    
+        /* FORCE_STANDARD_BACK_BUTTON_STYLE */
+
+        .back-button-wrap {
+            width: 100% !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+            margin: 28px 0 44px 0 !important;
+        }
+
+        .back-dashboard-btn {
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            gap: 14px !important;
+            min-width: 470px !important;
+            padding: 26px 58px !important;
+            border-radius: 999px !important;
+            text-decoration: none !important;
+            color: #f8fafc !important;
+            font-size: 34px !important;
+            font-weight: 950 !important;
+            line-height: 1 !important;
+            letter-spacing: -0.04em !important;
+            background:
+                linear-gradient(180deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.98)) !important;
+            border: 1px solid rgba(148, 163, 184, 0.34) !important;
+            box-shadow:
+                0 26px 72px rgba(0, 0, 0, 0.42),
+                inset 0 1px 0 rgba(255, 255, 255, 0.10) !important;
+            transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease, filter 0.16s ease !important;
+        }
+
+        .back-dashboard-btn::before {
+            content: "←" !important;
+            color: #93c5fd !important;
+            font-size: 40px !important;
+            font-weight: 950 !important;
+            line-height: 1 !important;
+        }
+
+        .back-dashboard-btn:hover {
+            transform: translateY(-2px) scale(1.01) !important;
+            border-color: rgba(147, 197, 253, 0.48) !important;
+            box-shadow:
+                0 32px 84px rgba(0, 0, 0, 0.50),
+                0 0 38px rgba(96, 165, 250, 0.16),
+                inset 0 1px 0 rgba(255, 255, 255, 0.14) !important;
+            filter: brightness(1.08) !important;
+        }
+
+        @media (max-width: 700px) {
+            .back-dashboard-btn {
+                min-width: unset !important;
+                width: 100% !important;
+                font-size: 24px !important;
+                padding: 20px 28px !important;
+            }
+
+            .back-dashboard-btn::before {
+                font-size: 30px !important;
+            }
+        }
+
+    
+        .loading-pulse-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: #34d399;
+            margin-right: 8px;
+            box-shadow: 0 0 16px rgba(52, 211, 153, 0.75);
+            animation: pulseDot 1s infinite ease-in-out;
+        }
+
+        @keyframes pulseDot {
+            0%, 100% { transform: scale(0.85); opacity: 0.55; }
+            50% { transform: scale(1.25); opacity: 1; }
+        }
+
+        .indeterminate-progress {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .indeterminate-progress::after {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: -35%;
+            width: 35%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+            animation: progressSweep 1.2s infinite ease-in-out;
+        }
+
+        @keyframes progressSweep {
+            0% { left: -35%; }
+            100% { left: 100%; }
         }
 
     </style>
@@ -1293,8 +1708,7 @@ async def password_protect_dashboard(request: Request, call_next):
                         type="password"
                         name="password"
                         placeholder="Dashboard password"
-                        required
-                        style="width: 100%; margin-bottom: 12px;"
+                            style="width: 100%; margin-bottom: 12px;"
                     >
                     <button type="submit" class="btn btn-blue" style="width:100%;">
                         Enter Dashboard
@@ -2149,7 +2563,11 @@ def screener_results_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Market Screener</h1>
@@ -2451,7 +2869,11 @@ def recommendations_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Full AI Recommendation Scan</h1>
@@ -2839,7 +3261,11 @@ def sectors_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Sector Intelligence</h1>
@@ -3050,7 +3476,11 @@ def performance_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Performance Tracker</h1>
@@ -3216,7 +3646,7 @@ def run_fast_scan_route(
 
 def get_deep_review_candidate_map(max_candidates=8):
     """
-    Returns tickers selected for Deep AI Review from the latest Fast Scan results.
+    Returns tickers selected for Deep AI Review from the latest Quant Scan results.
 
     Example:
     {
@@ -3249,7 +3679,7 @@ def get_deep_review_candidate_map(max_candidates=8):
 def get_deep_review_suggestions_html(max_candidates=8):
     """
     Builds the green candidate box on /deep-review.
-    Safe fallback if Fast Scan has not been run yet.
+    Safe fallback if Quant Scan has not been run yet.
     """
     try:
         selection = select_candidates_for_deep_review(
@@ -3267,7 +3697,7 @@ def get_deep_review_suggestions_html(max_candidates=8):
         if not tickers:
             return """
                 <div class="warning-callout">
-                    No eligible Fast Scan candidates found yet. Run Fast Scan first.
+                    No eligible Quant Scan candidates found yet. Run Quant Scan first.
                 </div>
             """
 
@@ -3278,7 +3708,7 @@ def get_deep_review_suggestions_html(max_candidates=8):
 
         return f"""
             <div class="success-callout">
-                <b>Auto-selected from Fast Scan:</b>
+                <b>Auto-selected from Quant Scan:</b>
                 <div style="margin-top:10px;">{chips}</div>
                 <p class="small muted" style="margin-bottom:0;">
                     Leave the manual ticker box blank and Deep AI Review will use these automatically.
@@ -3289,7 +3719,7 @@ def get_deep_review_suggestions_html(max_candidates=8):
     except Exception as e:
         return f"""
             <div class="warning-callout">
-                Could not load Fast Scan candidates yet: {escape(str(e))}
+                Could not load Quant Scan candidates yet: {escape(str(e))}
             </div>
         """
 
@@ -3362,7 +3792,7 @@ def fast_scan_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="10">No fast scan candidates yet.</td>
+            <td colspan="10">No quant scan candidates yet.</td>
         </tr>
         """
 
@@ -3374,37 +3804,68 @@ def fast_scan_page():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Olympus Fast Scan</title>
+        <title>Olympus Quant Scan</title>
         {refresh_tag}
         {shared_css()}
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
-            <h1>Fast Scan</h1>
+            <h1>Quant Scan</h1>
             <p class="subtitle">
-                Fast Scan ranks stocks quantitatively first. Rows with the green
+                Quant Scan ranks stocks quantitatively first. Rows with the green
                 <b>validated for deep scan</b> badge are automatically moved into Deep AI Review
                 if you leave the Deep Review ticker box blank.
             </p>
         </div>
 
-        <section class="card">
-            <h2>Run Fast Scan</h2>
+        {render_workflow_guide("quant")}
 
-            {render_task_status("Fast Scan", status)}
+        <section class="card">
+            <h2>Run Quant Scan</h2>
+
+            {render_task_status("Quant Scan", status)}
 
             <form method="post" action="/run-fast-scan" class="loading-form">
-                <input type="number" name="top_n" value="25" min="1" max="200">
-                <input type="text" name="max_symbols" placeholder="max symbols, or all">
-                <button type="submit">Run Fast Scan</button>
+                
+                <label class="muted small" style="display:block; margin-bottom:6px;">
+                    Candidates to return
+                </label>
+                <input
+                    type="number"
+                    name="top_n"
+                    value="25"
+                    min="1"
+                    max="200"
+                    title="How many ranked candidates you want Quant Scan to return"
+                >
+                <div class="muted small" style="margin-bottom:10px;">
+                    This is the number of ranked candidates shown after the scan, not the dollar amount and not the number of stocks scanned internally.
+                </div>
+    
+                
+                <label class="muted small" style="display:block; margin-bottom:6px;">
+                    Max symbols to scan internally
+                </label>
+                <input
+                    type="text"
+                    name="max_symbols"
+                    placeholder="max symbols, or all"
+                    title="How many market symbols the scanner is allowed to inspect before ranking candidates"
+                >
+    
+                <button type="submit">Run Quant Scan</button>
             </form>
         </section>
 
         <section class="card">
-            <h2>Fast Scan Candidates</h2>
+            <h2>Quant Scan Candidates</h2>
             <table>
                 <tr>
                     <th>Ticker</th>
@@ -3412,7 +3873,7 @@ def fast_scan_page():
                     <th>Company</th>
                     <th>Sector</th>
                     <th>Industry</th>
-                    <th>Fast Scan Score</th>
+                    <th>Quant Scan Score</th>
                     <th>Close</th>
                     <th>RSI</th>
                     <th>Volume Ratio</th>
@@ -3427,6 +3888,49 @@ def fast_scan_page():
 
     return HTMLResponse(html)
 
+
+
+def parse_ticker_input(value):
+    raw = str(value or "").strip()
+
+    if not raw:
+        return None
+
+    tickers = [
+        item.strip().upper()
+        for item in raw.replace("\n", ",").replace(" ", ",").split(",")
+        if item.strip()
+    ]
+
+    return tickers or None
+
+
+def run_deep_review_background(tickers=None, allow_execution=False):
+    """
+    Runs Deep AI Review in the background.
+
+    tickers=None means deep_review.py should auto-select the best Quant Scan candidates.
+    """
+    if tickers == [] or tickers == "" or tickers == "None":
+        tickers = None
+
+    try:
+        return run_deep_review(
+            tickers=tickers,
+            allow_execution=bool(allow_execution),
+        )
+    except TypeError:
+        try:
+            return run_deep_review(
+                tickers=tickers,
+                execute=bool(allow_execution),
+            )
+        except TypeError:
+            if tickers is None:
+                return run_deep_review()
+            return run_deep_review(tickers)
+
+
 @app.post("/run-deep-review")
 def run_deep_review_route(
     tickers: str = Form(""),
@@ -3435,15 +3939,13 @@ def run_deep_review_route(
     if deep_review_lock.locked():
         return RedirectResponse(url="/deep-review", status_code=303)
 
-    parsed_tickers = [t.strip().upper() for t in str(tickers or "").replace("\n", ",").split(",") if t.strip()]
+    parsed_tickers = parse_ticker_input(tickers)
     execute = bool(allow_execution)
 
-    # Blank ticker input means: automatically use best Fast Scan candidates.
-    tickers_for_review = parsed_tickers if parsed_tickers else None
-
+    # parsed_tickers=None means auto-select from Quant Scan.
     thread = threading.Thread(
         target=run_deep_review_background,
-        args=(tickers_for_review, execute),
+        args=(parsed_tickers, execute),
         daemon=True,
     )
     thread.start()
@@ -3515,14 +4017,20 @@ def deep_review_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Deep AI Review</h1>
             <p class="subtitle">
-                Run the full Olympus AI loop only on selected tickers. This is slower, but much more detailed.
+                Step 2: run the full AI review on tickers selected by Quant Scan, or manually enter tickers you want reviewed.
             </p>
         </div>
+
+        {render_workflow_guide("deep")}
 
         <div class="card">
             <h2>Run Deep AI Review</h2>
@@ -3530,14 +4038,20 @@ def deep_review_page():
 
             {deep_review_suggestions_html}
 
+            
+            <div class="callout" style="margin-bottom:16px;">
+                Leave the ticker box blank to automatically use the candidates marked
+                <b>validated for deep scan</b> from Quant Scan.
+            </div>
+
             <form method="post" action="/run-deep-review" class="loading-form">
+    
                 <label>Tickers:</label>
                 <input
                     type="text"
                     name="tickers"
-                    placeholder="NVDA,AAPL,TSLA"
+                    placeholder="Optional: leave blank to use Quant Scan selections"
                     style="width: 420px;"
-                    required
                 >
 
                 <label>
@@ -3653,8 +4167,30 @@ def positions_page(request: Request):
                 <td>{money(avg_entry)} / {money(current_price)}</td>
                 <td>{money(unrealized_pl)}<br>{unrealized_plpc:.2f}%</td>
                 <td>RSI: {rsi}<br>Vol: {volume_ratio}</td>
-                <td>{reasons_html}<br>{headline_html}</td>
+                <td>
+                    <a href="#details-{ticker}" class="btn btn-dark" style="padding:7px 11px; font-size:12px;">
+                        Jump to details
+                    </a>
+                </td>
                 <td>{action_html}</td>
+            </tr>
+
+            <tr id="details-{ticker}" class="position-detail-row">
+                <td colspan="10">
+                    <details class="ai-details full-row-details">
+                        <summary>View full reasoning / news for {ticker}</summary>
+                        <div class="full-width-detail-box">
+                            <div>
+                                <h4>Decision reasoning</h4>
+                                {reasons_html}
+                            </div>
+                            <div>
+                                <h4>Recent headlines</h4>
+                                {headline_html}
+                            </div>
+                        </div>
+                    </details>
+                </td>
             </tr>
             """
 
@@ -3677,7 +4213,11 @@ def positions_page(request: Request):
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>Position Monitor</h1>
@@ -3713,18 +4253,21 @@ def positions_page(request: Request):
             <h2>Run Position Review</h2>
             <p class="muted small">Last generated: {escape(str(generated_at))}</p>
 
-            <form method="post" action="/positions/review">
+            {render_task_status("Position Review", status)}
+
+            <form method="post" action="/positions/review" class="loading-form">
                 <button type="submit">Review Open Positions</button>
             </form>
 
             <div class="warning-callout" style="margin-top:16px;">
                 Sell buttons only work if ALPACA_PAPER=true and SELL_TRADING_ENABLED=true.
-                Keep SELL_TRADING_ENABLED=false until you are ready to test paper sell orders.
+                After regular market hours, sell orders may be queued for the next trading day unless they are extended-hours eligible.
             </div>
         </section>
 
         <section class="card">
             <h2>Open Position Sell Review</h2>
+            {market_hours_queue_warning("sell")}
             <table>
                 <tr>
                     <th>Ticker</th>
@@ -3735,7 +4278,7 @@ def positions_page(request: Request):
                     <th>Entry / Current</th>
                     <th><span class="term" title="Open profit or loss before selling the position.">Unrealized P/L</span></th>
                     <th>Technicals</th>
-                    <th>Reasoning / News</th>
+                    <th>Details</th>
                     <th>Action</th>
                 </tr>
                 {rows}
@@ -3752,6 +4295,18 @@ def positions_page(request: Request):
 def run_positions_review():
     if position_review_lock.locked():
         return RedirectResponse(url="/positions", status_code=303)
+
+    write_json(POSITION_REVIEW_STATUS_PATH, {
+        "status": "running",
+        "message": "Reviewing open positions. Checking P/L, technicals, rules, and recent news.",
+        "current": 0,
+        "total": 1,
+        "percent": 5,
+        "current_ticker": None,
+        "started_at": now_iso(),
+        "updated_at": now_iso(),
+        "error": None,
+    })
 
     thread = threading.Thread(
         target=run_position_review_background,
@@ -3924,10 +4479,12 @@ def ai_position_review_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p>
-            <a href="/">← Back to Dashboard</a> |
-            <a href="/positions">Rule-Based Position Monitor</a>
-        </p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
+        <p style="text-align:center;"><a href="/positions">Rule-Based Position Monitor</a></p>
 
         <div class="page-header">
             <h1>AI Position Review</h1>
@@ -3969,7 +4526,7 @@ def ai_position_review_page():
 
             <div class="danger-callout" style="margin-top:14px;">
                 Paper sell buttons still require ALPACA_PAPER=true and SELL_TRADING_ENABLED=true.
-                Keep SELL_TRADING_ENABLED=false until you are ready to test paper sells.
+                After regular market hours, sell orders may be queued for the next trading day unless they are extended-hours eligible.
             </div>
         </section>
 
@@ -4081,7 +4638,11 @@ def trade_theses_page(request: Request):
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a> | <a href="/positions/ai">AI Position Review</a></p>
+        <p>
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+ | <a href="/positions/ai">AI Position Review</a></p>
 
         <div class="page-header">
             <h1>Trade Thesis Memory</h1>
@@ -4134,7 +4695,11 @@ def screening_info_page():
                 checks quality, reviews technical signals, looks at news, then lets the AI agents
                 and risk engine decide whether the idea is strong enough.
             </p>
-            <a class="btn btn-dark" href="/">Back to Dashboard</a>
+            
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
         </div>
 
         <section class="card">
@@ -4350,7 +4915,11 @@ def all_agent_decisions_page():
         {premium_ui_css()}
     </head>
     <body>
-        <p><a href="/">← Back to Dashboard</a></p>
+        
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
 
         <div class="page-header">
             <h1>All Agent Decisions</h1>
@@ -4530,8 +5099,66 @@ def build_position_intelligence_table(positions):
         </table>
     """
 
+
+
+def get_alpaca_headers():
+    key = (
+        os.getenv("ALPACA_API_KEY")
+        or os.getenv("APCA_API_KEY_ID")
+        or os.getenv("ALPACA_KEY_ID")
+    )
+    secret = (
+        os.getenv("ALPACA_SECRET_KEY")
+        or os.getenv("APCA_API_SECRET_KEY")
+        or os.getenv("ALPACA_SECRET")
+    )
+
+    if not key or not secret:
+        raise ValueError("Missing Alpaca API key/secret in .env")
+
+    return {
+        "APCA-API-KEY-ID": key,
+        "APCA-API-SECRET-KEY": secret,
+    }
+
+
+def get_alpaca_base_url():
+    return (
+        os.getenv("ALPACA_BASE_URL")
+        or os.getenv("APCA_API_BASE_URL")
+        or "https://paper-api.alpaca.markets"
+    ).rstrip("/")
+
+
+def get_pending_alpaca_orders():
+    base = get_alpaca_base_url()
+
+    response = requests.get(
+        f"{base}/v2/orders",
+        headers=get_alpaca_headers(),
+        params={
+            "status": "open",
+            "limit": 100,
+            "nested": "true",
+            "direction": "desc",
+        },
+        timeout=20,
+    )
+
+    if response.status_code >= 400:
+        raise ValueError(response.text)
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
 @app.get("/", response_class=HTMLResponse)
 def home(chart_range: str = "1M"):
+    intelligence_table = ""
+
     try:
         account, positions = get_cached_account_and_positions()
         save_portfolio_snapshot(account)
@@ -4542,33 +5169,6 @@ def home(chart_range: str = "1M"):
         portfolio_chart = build_portfolio_line_chart(filtered_portfolio_history, chart_range)
 
         company_pie, sector_pie = build_portfolio_pies(positions)
-        intelligence_table = build_position_intelligence_table(positions)
-
-        logs = get_recent_trade_logs(limit=5)
-        summary = summarize_logs(get_today_trade_logs())
-
-        log_rows = ""
-        for log in logs:
-            ticker = escape(str(log.get("ticker", "")))
-            status = escape(str(log.get("final_status", "")))
-            css = status_class(status)
-            timestamp = escape(str(log.get("timestamp", "")))
-
-            pm = log.get("pm_decision", {}) or {}
-            reasoning = escape(str(pm.get("reasoning", "")))
-
-            log_rows += f"""
-                <tr>
-                    <td>{timestamp}</td>
-                    <td><b>{ticker}</b></td>
-                    <td>{badge(status, css)}</td>
-                    <td>{reasoning}</td>
-                </tr>
-            """
-
-        if not log_rows:
-            log_rows = "<tr><td colspan='4' class='empty'>No recent decisions yet.</td></tr>"
-
         trade_test_status = read_json(TRADE_TEST_STATUS_PATH, {
             "status": "not_started",
             "message": "No paper trade submission is running.",
@@ -4593,13 +5193,16 @@ def home(chart_range: str = "1M"):
                 <p class="subtitle">Portfolio dashboard, paper trading controls, scans, reviews, and agent decisions.</p>
 
                 <div class="button-row">
-                    <a class="btn btn-dark" href="/fast-scan">Fast Scan</a>
+                    <a class="btn btn-dark" href="/fast-scan">Quant Scan</a>
                     <a class="btn btn-dark" href="/deep-review">Deep AI Review</a>
                     <a class="btn btn-dark" href="/positions">Positions</a>
                     <a class="btn btn-dark" href="/agent-decisions">All Agent Decisions</a>
+                    <a class="btn btn-dark" href="/orders">Pending Orders</a>
                     <a class="btn btn-dark" href="/screening-info">Screening Info</a>
                 </div>
             </div>
+
+            {render_workflow_guide("trade")}
 
             <section class="card">
                 <h2>Portfolio Value Over Time</h2>
@@ -4622,40 +5225,15 @@ def home(chart_range: str = "1M"):
 
                 <form method="post" action="/run-ticker" class="loading-form" style="margin-top:16px;">
                     <input type="text" name="ticker" placeholder="Enter ticker, e.g. TSLA" required>
-                    <input type="number" name="notional_value" value="100" min="1" step="1" placeholder="Paper trade dollars">
+                    <label class="muted small" style="display:block; margin-bottom:6px;">Trade Amount ($)</label><input type="number" name="notional_value" value="100" min="1" step="1" placeholder="Trade Amount ($)" title="Dollar amount to buy, not number of shares">
                     <button type="submit">Submit Paper Trade</button>
                 </form>
-            </section>
 
-            <h2 class="section-title">Today's Decision Summary</h2>
-            <div class="grid grid-4">
-                <div class="card"><div class="metric-title">Recommended</div><div class="big-number">{summary.get("recommended", 0)}</div></div>
-                <div class="card"><div class="metric-title">Submitted</div><div class="big-number">{summary.get("submitted", 0)}</div></div>
-                <div class="card"><div class="metric-title">Vetoed</div><div class="big-number">{summary.get("vetoed", 0)}</div></div>
-                <div class="card"><div class="metric-title">Blocked / Errors</div><div class="big-number">{summary.get("blocked", 0) + summary.get("errors", 0)}</div></div>
-            </div>
-
-            <section class="card">
-                <h2>Position Intelligence</h2>
-                {intelligence_table}
+                {market_hours_queue_warning("buy")}
             </section>
-
-            <section class="card">
-                <h2>Recent Agent Decisions</h2>
-                <div class="button-row">
-                    <a class="btn btn-dark" href="/agent-decisions">View All Agent Decisions</a>
-                </div>
-                <table>
-                    <tr>
-                        <th>Time</th>
-                        <th>Ticker</th>
-                        <th>Status</th>
-                        <th>Reasoning</th>
-                    </tr>
-                    {log_rows}
-                </table>
-            </section>
-        </body>
+</div>
+</div>
+</body>
         </html>
         """
 
@@ -4666,7 +5244,7 @@ def home(chart_range: str = "1M"):
             f"""
             <h1>Dashboard failed to load</h1>
             <pre>{escape(str(e))}</pre>
-            <p><a href="/fast-scan">Fast Scan</a></p>
+            <p><a href="/fast-scan">Quant Scan</a></p>
             <p><a href="/deep-review">Deep AI Review</a></p>
             <p><a href="/positions">Positions</a></p>
             """,
@@ -4728,7 +5306,7 @@ def build_pie_chart(items, title):
     if not clean or total <= 0:
         return f"""
             <div class="allocation-card">
-                <h3>{escape(str(title))}</h3>
+                <h3>{running_dot}{escape(str(title))}</h3>
                 <p class="empty">No allocation data available.</p>
             </div>
         """
@@ -5277,4 +5855,153 @@ def build_portfolio_pies(positions):
         build_pie_chart(by_sector, "Sector Allocation"),
     )
 
+
+@app.post("/run-ticker")
+def run_ticker(
+    ticker: str = Form(...),
+    notional_value: float = Form(100),
+):
+    ticker = str(ticker or "").strip().upper()
+
+    if not ticker.isalnum() or len(ticker) > 10:
+        return HTMLResponse(
+            "<h2>Invalid ticker.</h2><p>Use symbols like NVDA, TSLA, AAPL.</p><p><a href='/'>Back</a></p>",
+            status_code=400,
+        )
+
+    try:
+        submit_paper_market_order(
+            ticker=ticker,
+            direction="long",
+            notional_value=float(notional_value),
+        )
+    except Exception as e:
+        return HTMLResponse(
+            f"""
+            <h2>Paper trade failed for {escape(ticker)}</h2>
+            <pre>{escape(str(e))}</pre>
+            <p><a href="/">Back to dashboard</a></p>
+            """,
+            status_code=500,
+        )
+
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/run-ticker")
+def run_ticker_get_redirect():
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/orders", response_class=HTMLResponse)
+def pending_orders_page():
+    try:
+        orders = get_pending_alpaca_orders()
+        error = None
+    except Exception as e:
+        orders = []
+        error = str(e)
+
+    rows = ""
+
+    for order in orders:
+        symbol = escape(str(order.get("symbol", "")))
+        side = escape(str(order.get("side", ""))).upper()
+        order_type = escape(str(order.get("type", "")))
+        status = escape(str(order.get("status", "")))
+        qty = escape(str(order.get("qty", "")))
+        notional = escape(str(order.get("notional", "")))
+        limit_price = escape(str(order.get("limit_price", "")))
+        submitted_at = escape(str(order.get("submitted_at", "")))
+        created_at = escape(str(order.get("created_at", "")))
+        order_id = escape(str(order.get("id", "")))
+
+        amount = qty
+        if notional and notional.lower() != "none":
+            amount = f"${notional}"
+        elif qty and qty.lower() != "none":
+            amount = f"{qty} shares"
+        else:
+            amount = "—"
+
+        price_info = limit_price if limit_price and limit_price.lower() != "none" else "market/none"
+
+        css = "approved" if side == "BUY" else "blocked"
+
+        rows += f"""
+            <tr>
+                <td><b>{symbol}</b></td>
+                <td>{badge(side, css)}</td>
+                <td>{amount}</td>
+                <td>{order_type}</td>
+                <td>{status}</td>
+                <td>{price_info}</td>
+                <td>{submitted_at or created_at}</td>
+                <td><code>{order_id}</code></td>
+            </tr>
+        """
+
+    if not rows:
+        rows = """
+            <tr>
+                <td colspan="8" class="empty">No pending/open Alpaca orders right now.</td>
+            </tr>
+        """
+
+    error_html = ""
+    if error:
+        error_html = f"""
+            <div class="danger-callout">
+                Could not load pending orders:
+                <pre>{escape(error)}</pre>
+            </div>
+        """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Pending Orders</title>
+        {shared_css()}
+        {premium_ui_css()}
+    </head>
+    <body>
+        <div class="back-button-wrap">
+            <a href="/" class="back-dashboard-btn">Back to Dashboard</a>
+        </div>
+
+        <div class="page-header">
+            <h1>Pending Orders</h1>
+            <p class="subtitle">
+                Shows open Alpaca paper orders that are waiting, queued, accepted, or not fully filled yet.
+            </p>
+        </div>
+
+        {error_html}
+
+        <section class="card">
+            <h2>Open / Pending Alpaca Orders</h2>
+            <div class="warning-callout">
+                If you submitted a buy or sell after regular market hours, it may appear here until the next eligible trading session.
+            </div>
+
+            <table>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Side</th>
+                    <th>Amount</th>
+                    <th>Order Type</th>
+                    <th>Status</th>
+                    <th>Limit / Price</th>
+                    <th>Submitted</th>
+                    <th>Order ID</th>
+                </tr>
+                {rows}
+            </table>
+        </section>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
 

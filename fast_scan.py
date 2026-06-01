@@ -273,7 +273,7 @@ def run_fast_scan(
             "message": f"Enriching {ticker} with company sector and quality review.",
             "current": i - 1,
             "total": total_candidates,
-            "percent": round(((i - 1) / max(total_candidates, 1)) * 100, 1),
+            "percent": round(25 + (((i - 1) / max(total_candidates, 1)) * 60), 1),
             "current_ticker": ticker,
             "updated_at": now_iso(),
             "top_n": top_n,
@@ -350,6 +350,20 @@ def run_fast_scan(
     ranked_all = ranked_approved if only_quality_approved else ranked_approved + ranked_rejected
 
     display_candidates = ranked_all[:int(top_n or len(ranked_all))]
+
+    write_json(FAST_SCAN_STATUS_PATH, {
+        "status": "running",
+        "message": f"Phase 3/3: ranking {len(ranked_all)} eligible candidates relative to each other.",
+        "current": 3,
+        "total": 3,
+        "percent": 90,
+        "phase": "relative_ranking",
+        "current_ticker": None,
+        "updated_at": now_iso(),
+        "top_n": top_n,
+        "max_symbols": max_symbols,
+        "sector": sector or None,
+    })
 
     payload = {
         "generated_at": now_iso(),
